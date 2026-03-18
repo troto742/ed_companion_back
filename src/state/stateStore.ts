@@ -38,6 +38,15 @@ export interface StoreCheckpoint {
 
 export class StateStore {
   private ship: StateSnapshot["ship"] = {
+    shipType: null,
+    shipName: null,
+    shipIdent: null,
+    shipId: null,
+    cargoCapacity: null,
+    fuelCapacityMain: null,
+    fuelCapacityReserve: null,
+    maxJumpRange: null,
+    lastJumpDistance: null,
     flags: null,
     interpretedFlags: {
       docked: false,
@@ -219,6 +228,7 @@ export class StateStore {
 
     const event = eventType.trim().toLowerCase();
     let locationPatchApplied = false;
+    let shipPatchApplied = false;
     let routeUpdated = false;
 
     const updateLocationFromPatch = (patch: Partial<StateSnapshot["location"]>): boolean => {
@@ -230,8 +240,52 @@ export class StateStore {
       return changed;
     };
 
+    const updateShipFromPatch = (patch: Partial<StateSnapshot["ship"]>): boolean => {
+      const nextShip = { ...this.ship, ...patch, updatedAt: timestamp };
+      const changed = JSON.stringify(nextShip) !== JSON.stringify(this.ship);
+      if (changed) {
+        this.ship = nextShip;
+      }
+      return changed;
+    };
+
     switch (event) {
+      case "loadgame": {
+        shipPatchApplied = updateShipFromPatch({
+          shipType: this.readString(data, ["Ship", "ShipType", "ship"], this.ship.shipType),
+          shipName: this.readString(data, ["ShipName", "Ship_Localised", "shipName"], this.ship.shipName),
+          shipIdent: this.readString(data, ["ShipIdent", "ShipIDent", "shipIdent"], this.ship.shipIdent),
+          shipId: this.readNumber(data, ["ShipID", "ShipId", "shipId"], this.ship.shipId),
+          fuelCapacityMain: this.readNumber(data, ["FuelCapacity", "fuelCapacity"], this.ship.fuelCapacityMain)
+        });
+        break;
+      }
+      case "loadout": {
+        shipPatchApplied = updateShipFromPatch({
+          shipType: this.readString(data, ["Ship", "ShipType", "ship"], this.ship.shipType),
+          shipName: this.readString(data, ["ShipName", "Ship_Localised", "shipName"], this.ship.shipName),
+          shipIdent: this.readString(data, ["ShipIdent", "ShipIDent", "shipIdent"], this.ship.shipIdent),
+          shipId: this.readNumber(data, ["ShipID", "ShipId", "shipId"], this.ship.shipId),
+          cargoCapacity: this.readNumber(data, ["CargoCapacity", "cargoCapacity"], this.ship.cargoCapacity),
+          fuelCapacityMain: this.readNestedNumber(
+            data,
+            [["FuelCapacity", "Main"], ["FuelCapacity", "MainFuel"], ["fuelCapacity", "main"]],
+            this.ship.fuelCapacityMain
+          ),
+          fuelCapacityReserve: this.readNestedNumber(
+            data,
+            [["FuelCapacity", "Reserve"], ["FuelCapacity", "ReserveFuel"], ["fuelCapacity", "reserve"]],
+            this.ship.fuelCapacityReserve
+          ),
+          maxJumpRange: this.readNumber(data, ["MaxJumpRange", "maxJumpRange"], this.ship.maxJumpRange)
+        });
+        break;
+      }
       case "fsdjump": {
+        shipPatchApplied = updateShipFromPatch({
+          lastJumpDistance: this.readNumber(data, ["JumpDist", "JumpDistance", "jumpDist"], this.ship.lastJumpDistance)
+        });
+
         const starSystem = String(data.StarSystem ?? "").trim();
         locationPatchApplied = updateLocationFromPatch({
           starSystem: starSystem || this.location.starSystem,
@@ -297,7 +351,7 @@ export class StateStore {
     }
 
     return {
-      shipUpdated: false,
+      shipUpdated: shipPatchApplied,
       locationUpdated: locationPatchApplied,
       routeUpdated,
       ignored: false
@@ -385,9 +439,58 @@ export class StateStore {
     return fallback;
   }
 
+  private readNumber(
+    data: Record<string, unknown>,
+    keys: string[],
+    fallback: number | null
+  ): number | null {
+    for (const key of keys) {
+      const rawValue = data[key];
+      if (typeof rawValue === "number" && Number.isFinite(rawValue)) {
+        return rawValue;
+      }
+    }
+
+    return fallback;
+  }
+
+  private readNestedNumber(
+    data: Record<string, unknown>,
+    paths: string[][],
+    fallback: number | null
+  ): number | null {
+    for (const path of paths) {
+      let current: unknown = data;
+
+      for (const segment of path) {
+        if (!current || typeof current !== "object") {
+          current = undefined;
+          break;
+        }
+
+        current = (current as Record<string, unknown>)[segment];
+      }
+
+      if (typeof current === "number" && Number.isFinite(current)) {
+        return current;
+      }
+    }
+
+    return fallback;
+  }
+
   private applySnapshot(snapshot: StateSnapshot): void {
     this.ship = {
       ...snapshot.ship,
+      shipType: snapshot.ship.shipType ?? null,
+      shipName: snapshot.ship.shipName ?? null,
+      shipIdent: snapshot.ship.shipIdent ?? null,
+      shipId: snapshot.ship.shipId ?? null,
+      cargoCapacity: snapshot.ship.cargoCapacity ?? null,
+      fuelCapacityMain: snapshot.ship.fuelCapacityMain ?? null,
+      fuelCapacityReserve: snapshot.ship.fuelCapacityReserve ?? null,
+      maxJumpRange: snapshot.ship.maxJumpRange ?? null,
+      lastJumpDistance: snapshot.ship.lastJumpDistance ?? null,
       interpretedFlags: { ...snapshot.ship.interpretedFlags },
       fuel: { ...snapshot.ship.fuel }
     };

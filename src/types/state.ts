@@ -12,6 +12,15 @@ export interface InterpretedFlags {
 }
 
 export interface ShipState {
+  shipType: string | null;
+  shipName: string | null;
+  shipIdent: string | null;
+  shipId: number | null;
+  cargoCapacity: number | null;
+  fuelCapacityMain: number | null;
+  fuelCapacityReserve: number | null;
+  maxJumpRange: number | null;
+  lastJumpDistance: number | null;
   flags: number | null;
   interpretedFlags: InterpretedFlags;
   fuel: FuelState;
