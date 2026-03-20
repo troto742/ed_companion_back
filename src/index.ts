@@ -20,6 +20,7 @@ import { createAdminKeyRoutes } from "./routes/adminKeyRoutes";
 import { createIngestRoutes } from "./routes/ingestRoutes";
 import { createRouteRoutes } from "./routes/routeRoutes";
 import { createStateRoutes } from "./routes/stateRoutes";
+import { createTradeRoutes } from "./routes/tradeRoutes";
 import { createApiKeyStore, ApiKeyStore } from "./services/apiKeyStore";
 import { RuntimeRegistry, TenantRuntime } from "./state/runtimeRegistry";
 import { StateChangeSet } from "./types/state";
@@ -92,6 +93,16 @@ const bootstrap = async (): Promise<void> => {
       }
     }
 
+    if (settings.autoProvisionDefaultApiKey) {
+      const hasActiveKeys = await keyStore.hasActiveKeys();
+      if (!hasActiveKeys) {
+        const created = await keyStore.ensureActiveKey("default", settings.defaultApiKey);
+        console.warn(
+          `No active API keys found. Auto-provisioned default API key label='${created.label}' prefix='${created.keyPrefix}'.`
+        );
+      }
+    }
+
     authenticateApiKey = async (apiKey: string) => {
       if (settings.allowAnyApiKey) {
         return envAuthenticator(apiKey);
@@ -118,7 +129,13 @@ const bootstrap = async (): Promise<void> => {
   });
 
   const emitChanges = (runtime: TenantRuntime, changes: StateChangeSet): void => {
-    if (!changes.shipUpdated && !changes.locationUpdated && !changes.routeUpdated) {
+    if (
+      !changes.shipUpdated
+      && !changes.locationUpdated
+      && !changes.routeUpdated
+      && !changes.missionsUpdated
+      && !changes.colonizationUpdated
+    ) {
       return;
     }
 
@@ -135,6 +152,14 @@ const bootstrap = async (): Promise<void> => {
 
     if (changes.routeUpdated) {
       io.to(room).emit("RouteUpdated", snapshot.route);
+    }
+
+    if (changes.missionsUpdated) {
+      io.to(room).emit("MissionUpdated", snapshot.missions);
+    }
+
+    if (changes.colonizationUpdated) {
+      io.to(room).emit("ColonizationUpdated", snapshot.colonization);
     }
 
     io.to(room).emit("StateUpdated", snapshot);
@@ -168,6 +193,11 @@ const bootstrap = async (): Promise<void> => {
     persistence
   }));
 
+  app.use("/api/trade", requireApiKey, createTradeRoutes({
+    resolveRuntime: (apiKey, tenantLabel, keyFingerprint) =>
+      runtimeRegistry.getRuntime(apiKey, tenantLabel, keyFingerprint)
+  }));
+
   app.use("/api", requireApiKey, createStateRoutes({
     resolveRuntime: (apiKey, tenantLabel, keyFingerprint) =>
       runtimeRegistry.getRuntime(apiKey, tenantLabel, keyFingerprint)
@@ -191,6 +221,8 @@ const bootstrap = async (): Promise<void> => {
         socket.emit("ShipUpdated", snapshot.ship);
         socket.emit("LocationUpdated", snapshot.location);
         socket.emit("RouteUpdated", snapshot.route);
+        socket.emit("MissionUpdated", snapshot.missions);
+        socket.emit("ColonizationUpdated", snapshot.colonization);
         socket.emit("StateUpdated", snapshot);
       } catch {
         socket.disconnect(true);

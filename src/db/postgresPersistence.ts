@@ -56,7 +56,9 @@ const parseJsonColumn = <T>(value: unknown): T | null => {
 
 const getSnapshotUpdatedAt = (snapshot: StateSnapshot): string => {
   return normalizeTimestamp(
-    snapshot.route.updatedAt
+    snapshot.colonization.updatedAt
+      ?? snapshot.missions.updatedAt
+      ?? snapshot.route.updatedAt
       ?? snapshot.location.updatedAt
       ?? snapshot.ship.updatedAt
       ?? new Date().toISOString()
@@ -89,7 +91,7 @@ export class PostgresPersistence implements PersistenceStore {
   async loadSnapshot(commanderName: string): Promise<StateSnapshot | null> {
     const commanderId = await this.ensureCommanderId(this.pool, commanderName);
     const result = await this.pool.query(
-      "SELECT ship, location, route FROM current_state WHERE commander_id = $1",
+      "SELECT ship, location, route, missions FROM current_state WHERE commander_id = $1",
       [commanderId]
     );
 
@@ -101,12 +103,28 @@ export class PostgresPersistence implements PersistenceStore {
     const ship = parseJsonColumn<StateSnapshot["ship"]>(row.ship);
     const location = parseJsonColumn<StateSnapshot["location"]>(row.location);
     const route = parseJsonColumn<StateSnapshot["route"]>(row.route);
+    const missions = parseJsonColumn<StateSnapshot["missions"]>(row.missions);
 
-    if (!ship || !location || !route) {
+    if (!ship || !location || !route || !missions) {
       return null;
     }
 
-    return { ship, location, route };
+    return {
+      ship,
+      location,
+      route,
+      missions,
+      colonization: {
+        isColonizing: false,
+        systemName: null,
+        marketId: null,
+        constructionProgress: null,
+        constructionComplete: false,
+        constructionFailed: false,
+        requiredCommodities: [],
+        updatedAt: null
+      }
+    };
   }
 
   async persistJournal(
@@ -138,6 +156,29 @@ export class PostgresPersistence implements PersistenceStore {
             JSON.stringify(event.data ?? {})
           ]
         );
+
+        const normalizedEventType = event.eventType.trim().toLowerCase();
+        if (normalizedEventType.startsWith("mission")) {
+          await client.query(
+            `
+              INSERT INTO mission_events (
+                commander_id,
+                mission_id,
+                event_ts,
+                event_type,
+                payload
+              )
+              VALUES ($1, $2, $3, $4, $5::jsonb)
+            `,
+            [
+              commanderId,
+              this.readMissionId(event.data),
+              normalizeTimestamp(event.timestamp),
+              event.eventType.trim(),
+              JSON.stringify(event.data ?? {})
+            ]
+          );
+        }
       }
 
       await this.upsertCurrentState(client, commanderId, snapshot);
@@ -281,12 +322,13 @@ export class PostgresPersistence implements PersistenceStore {
   ): Promise<void> {
     await client.query(
       `
-        INSERT INTO current_state (commander_id, ship, location, route, updated_at)
-        VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, $5)
+        INSERT INTO current_state (commander_id, ship, location, route, missions, updated_at)
+        VALUES ($1, $2::jsonb, $3::jsonb, $4::jsonb, $5::jsonb, $6)
         ON CONFLICT (commander_id) DO UPDATE
           SET ship = EXCLUDED.ship,
               location = EXCLUDED.location,
               route = EXCLUDED.route,
+              missions = EXCLUDED.missions,
               updated_at = EXCLUDED.updated_at
       `,
       [
@@ -294,9 +336,19 @@ export class PostgresPersistence implements PersistenceStore {
         JSON.stringify(snapshot.ship),
         JSON.stringify(snapshot.location),
         JSON.stringify(snapshot.route),
+        JSON.stringify(snapshot.missions),
         getSnapshotUpdatedAt(snapshot)
       ]
     );
+  }
+
+  private readMissionId(data: Record<string, unknown> | null | undefined): number | null {
+    if (!data || typeof data !== "object") {
+      return null;
+    }
+
+    const candidate = data.MissionID ?? data.MissionId ?? data.missionId;
+    return typeof candidate === "number" && Number.isFinite(candidate) ? candidate : null;
   }
 
   private async withTransaction<T>(

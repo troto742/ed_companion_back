@@ -158,6 +158,50 @@ export class ApiKeyStore {
     };
   }
 
+  async ensureActiveKey(labelInput: string, apiKeyInput: string): Promise<CreatedApiKey> {
+    const label = normalizeLabel(labelInput);
+    if (!label) {
+      throw new Error("Label is required.");
+    }
+
+    const apiKey = normalizeApiKey(apiKeyInput);
+    if (!apiKey) {
+      throw new Error("API key is required.");
+    }
+
+    const keyPrefix = this.getKeyPrefix(apiKey);
+    const keyHash = this.hashApiKey(apiKey);
+    const result = await this.pool.query<ApiKeyRow>(
+      `
+        INSERT INTO api_keys (key_prefix, key_hash, label, is_active, revoked_at)
+        VALUES ($1, $2, $3, TRUE, NULL)
+        ON CONFLICT (key_hash) DO UPDATE
+          SET label = EXCLUDED.label,
+              key_prefix = EXCLUDED.key_prefix,
+              is_active = TRUE,
+              revoked_at = NULL
+        RETURNING id, label, key_prefix, key_hash, is_active, created_at, last_used_at, revoked_at
+      `,
+      [keyPrefix, keyHash, label]
+    );
+
+    const row = result.rows[0];
+    if (!row) {
+      throw new Error("Unable to ensure API key.");
+    }
+
+    this.cache.clear();
+
+    return {
+      id: Number(row.id),
+      label: row.label,
+      keyPrefix: row.key_prefix,
+      keyFingerprint: row.key_hash.slice(0, 12),
+      createdAt: row.created_at,
+      apiKey
+    };
+  }
+
   async listKeys(): Promise<StoredApiKey[]> {
     const result = await this.pool.query<ApiKeyRow>(
       `
@@ -219,6 +263,21 @@ export class ApiKeyStore {
     }
 
     return inserted;
+  }
+
+  async hasActiveKeys(): Promise<boolean> {
+    const result = await this.pool.query<{ has_key: boolean }>(
+      `
+        SELECT EXISTS (
+          SELECT 1
+            FROM api_keys
+           WHERE is_active = TRUE
+             AND revoked_at IS NULL
+        ) AS has_key
+      `
+    );
+
+    return result.rows[0]?.has_key === true;
   }
 
   async close(): Promise<void> {

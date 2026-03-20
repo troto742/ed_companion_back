@@ -128,6 +128,8 @@ export const createIngestRoutes = (dependencies: IngestRouteDependencies): Route
           shipUpdated: false,
           locationUpdated: false,
           routeUpdated: false,
+          missionsUpdated: false,
+          colonizationUpdated: false,
           ignored: false
         };
 
@@ -143,6 +145,8 @@ export const createIngestRoutes = (dependencies: IngestRouteDependencies): Route
           aggregate.shipUpdated = aggregate.shipUpdated || changes.shipUpdated;
           aggregate.locationUpdated = aggregate.locationUpdated || changes.locationUpdated;
           aggregate.routeUpdated = aggregate.routeUpdated || changes.routeUpdated;
+          aggregate.missionsUpdated = aggregate.missionsUpdated || changes.missionsUpdated;
+          aggregate.colonizationUpdated = aggregate.colonizationUpdated || changes.colonizationUpdated;
         }
 
         if (processed > 0) {

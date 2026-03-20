@@ -1,6 +1,16 @@
 import { JournalPayload, StatusPayload } from "../types/ingest";
 import { interpretStatusFlags } from "../services/flags";
-import { RouteLeg, RouteState, StateChangeSet, StateSnapshot } from "../types/state";
+import {
+  ColonizationCommodityNeed,
+  ColonizationState,
+  MissionBoardState,
+  MissionReward,
+  MissionState,
+  RouteLeg,
+  RouteState,
+  StateChangeSet,
+  StateSnapshot
+} from "../types/state";
 
 const EVENT_HISTORY_LIMIT = 2_000;
 
@@ -82,6 +92,23 @@ export class StateStore {
     updatedAt: null
   };
 
+  private missions: MissionBoardState = {
+    active: [],
+    history: [],
+    updatedAt: null
+  };
+
+  private colonization: ColonizationState = {
+    isColonizing: false,
+    systemName: null,
+    marketId: null,
+    constructionProgress: null,
+    constructionComplete: false,
+    constructionFailed: false,
+    requiredCommodities: [],
+    updatedAt: null
+  };
+
   private seenEventKeys: Set<string> = new Set();
   private seenEventQueue: string[] = [];
 
@@ -98,6 +125,15 @@ export class StateStore {
         legs: [...this.route.legs],
         nextLeg: this.route.nextLeg ? { ...this.route.nextLeg } : null,
         previousLeg: this.route.previousLeg ? { ...this.route.previousLeg } : null
+      },
+      missions: {
+        updatedAt: this.missions.updatedAt,
+        active: this.missions.active.map((mission) => this.cloneMission(mission)),
+        history: this.missions.history.map((mission) => this.cloneMission(mission))
+      },
+      colonization: {
+        ...this.colonization,
+        requiredCommodities: this.colonization.requiredCommodities.map((item) => ({ ...item }))
       }
     };
   }
@@ -124,7 +160,15 @@ export class StateStore {
   applyStatus(payload: StatusPayload): StateChangeSet {
     const timestamp = normalizeTimestamp(payload.timestamp);
     if (isOutOfOrder(timestamp, this.ship.updatedAt)) {
-      return { shipUpdated: false, locationUpdated: false, routeUpdated: false, ignored: true, reason: "out_of_order" };
+      return {
+        shipUpdated: false,
+        locationUpdated: false,
+        routeUpdated: false,
+        missionsUpdated: false,
+        colonizationUpdated: false,
+        ignored: true,
+        reason: "out_of_order"
+      };
     }
 
     let shipUpdated = false;
@@ -201,20 +245,46 @@ export class StateStore {
       this.location.updatedAt = timestamp;
     }
 
-    return { shipUpdated, locationUpdated, routeUpdated: false, ignored: false };
+    return {
+      shipUpdated,
+      locationUpdated,
+      routeUpdated: false,
+      missionsUpdated: false,
+      colonizationUpdated: false,
+      ignored: false
+    };
   }
 
   applyJournal(payload: JournalPayload): StateChangeSet {
     const timestamp = normalizeTimestamp(payload.timestamp);
     const data = payload.data ?? {};
     const eventType = payload.eventType;
-    if (isOutOfOrder(timestamp, this.location.updatedAt)) {
-      return { shipUpdated: false, locationUpdated: false, routeUpdated: false, ignored: true, reason: "out_of_order" };
+    const event = eventType.trim().toLowerCase();
+    const isMissionEvent = event === "missions" || event.startsWith("mission");
+    const lastRelevantTimestamp = isMissionEvent ? this.missions.updatedAt : this.location.updatedAt;
+    if (isOutOfOrder(timestamp, lastRelevantTimestamp)) {
+      return {
+        shipUpdated: false,
+        locationUpdated: false,
+        routeUpdated: false,
+        missionsUpdated: false,
+        colonizationUpdated: false,
+        ignored: true,
+        reason: "out_of_order"
+      };
     }
 
     const eventKey = `${timestamp}|${eventType}|${JSON.stringify(data)}`;
     if (this.seenEventKeys.has(eventKey)) {
-      return { shipUpdated: false, locationUpdated: false, routeUpdated: false, ignored: true, reason: "duplicate" };
+      return {
+        shipUpdated: false,
+        locationUpdated: false,
+        routeUpdated: false,
+        missionsUpdated: false,
+        colonizationUpdated: false,
+        ignored: true,
+        reason: "duplicate"
+      };
     }
 
     this.seenEventKeys.add(eventKey);
@@ -226,10 +296,11 @@ export class StateStore {
       }
     }
 
-    const event = eventType.trim().toLowerCase();
     let locationPatchApplied = false;
     let shipPatchApplied = false;
     let routeUpdated = false;
+    let missionsUpdated = false;
+    let colonizationUpdated = false;
 
     const updateLocationFromPatch = (patch: Partial<StateSnapshot["location"]>): boolean => {
       const nextLocation = { ...this.location, ...patch, updatedAt: timestamp };
@@ -341,6 +412,42 @@ export class StateStore {
         locationPatchApplied = updateLocationFromPatch({ supercruise: false });
         break;
       }
+      case "missionaccepted": {
+        missionsUpdated = this.upsertMissionFromAccepted(data, timestamp);
+        break;
+      }
+      case "missionredirected": {
+        missionsUpdated = this.updateMissionFromRedirected(data, timestamp);
+        break;
+      }
+      case "cargodepot": {
+        missionsUpdated = this.updateMissionFromCargoDepot(data, timestamp);
+        break;
+      }
+      case "colonisationconstructiondepot": {
+        colonizationUpdated = this.updateColonizationFromConstructionDepot(data, timestamp);
+        break;
+      }
+      case "colonisationcontribution": {
+        colonizationUpdated = this.updateColonizationFromContribution(data, timestamp);
+        break;
+      }
+      case "missioncompleted": {
+        missionsUpdated = this.finishMission(data, "completed", timestamp);
+        break;
+      }
+      case "missionfailed": {
+        missionsUpdated = this.finishMission(data, "failed", timestamp);
+        break;
+      }
+      case "missionabandoned": {
+        missionsUpdated = this.finishMission(data, "abandoned", timestamp);
+        break;
+      }
+      case "missions": {
+        missionsUpdated = this.syncActiveMissionsFromList(data, timestamp);
+        break;
+      }
       default: {
         const starSystem = String(data.StarSystem ?? "").trim();
         if (starSystem) {
@@ -354,6 +461,8 @@ export class StateStore {
       shipUpdated: shipPatchApplied,
       locationUpdated: locationPatchApplied,
       routeUpdated,
+      missionsUpdated,
+      colonizationUpdated,
       ignored: false
     };
   }
@@ -379,8 +488,566 @@ export class StateStore {
       shipUpdated: false,
       locationUpdated: false,
       routeUpdated: true,
+      missionsUpdated: false,
+      colonizationUpdated: false,
       ignored: false
     };
+  }
+
+  private cloneMission(mission: MissionState): MissionState {
+    return {
+      ...mission,
+      rewards: mission.rewards.map((reward) => ({ ...reward }))
+    };
+  }
+
+  private readFiniteNumber(data: Record<string, unknown>, keys: string[]): number | null {
+    for (const key of keys) {
+      const value = data[key];
+      if (typeof value === "number" && Number.isFinite(value)) {
+        return value;
+      }
+    }
+
+    return null;
+  }
+
+  private readMissionId(data: Record<string, unknown>): number | null {
+    return this.readFiniteNumber(data, ["MissionID", "MissionId", "missionId"]);
+  }
+
+  private parseRewards(data: Record<string, unknown>): MissionReward[] {
+    const rewards: MissionReward[] = [];
+    const materialRewards = data.MaterialsReward;
+    const commodityRewards = data.CommodityReward;
+
+    if (Array.isArray(materialRewards)) {
+      for (const reward of materialRewards) {
+        if (!reward || typeof reward !== "object") {
+          continue;
+        }
+
+        const item = reward as Record<string, unknown>;
+        const name = this.readString(item, ["Name", "Name_Localised", "name"], "");
+        if (!name) {
+          continue;
+        }
+
+        rewards.push({
+          type: "material",
+          name,
+          count: this.readFiniteNumber(item, ["Count", "count"])
+        });
+      }
+    }
+
+    if (Array.isArray(commodityRewards)) {
+      for (const reward of commodityRewards) {
+        if (!reward || typeof reward !== "object") {
+          continue;
+        }
+
+        const item = reward as Record<string, unknown>;
+        const name = this.readString(item, ["Name", "Name_Localised", "name"], "");
+        if (!name) {
+          continue;
+        }
+
+        rewards.push({
+          type: "commodity",
+          name,
+          count: this.readFiniteNumber(item, ["Count", "count"])
+        });
+      }
+    }
+
+    return rewards;
+  }
+
+  private extractCommodityFromMissionText(
+    localizedName: string | null,
+    name: string | null
+  ): { commodity: string | null; commodityCount: number | null } {
+    const sourceText = localizedName?.trim() || name?.trim() || "";
+    if (!sourceText) {
+      return { commodity: null, commodityCount: null };
+    }
+
+    const normalized = sourceText.replace(/\s+/g, " ").trim();
+    const patterns = [
+      /(?:source and return|mine|deliver|acquire)\s+(\d+)\s+units?\s+of\s+(.+)$/i,
+      /(?:source and return|mine|deliver|acquire)\s+(\d+)\s+(.+)$/i
+    ];
+
+    for (const pattern of patterns) {
+      const match = normalized.match(pattern);
+      if (!match) {
+        continue;
+      }
+
+      const count = Number(match[1]);
+      const commodity = match[2]?.trim() ?? "";
+      if (!Number.isFinite(count) || !commodity) {
+        continue;
+      }
+
+      return {
+        commodity,
+        commodityCount: count
+      };
+    }
+
+    return { commodity: null, commodityCount: null };
+  }
+
+  private extractMaxCreditsReward(data: Record<string, unknown>, fallback: number | null = null): number | null {
+    const candidates: number[] = [];
+
+    const direct = this.readFiniteNumber(data, ["Reward", "reward", "Donation"]);
+    if (direct !== null) {
+      candidates.push(direct);
+    }
+
+    const rewardOptions = data.Rewards;
+    if (Array.isArray(rewardOptions)) {
+      for (const option of rewardOptions) {
+        if (!option || typeof option !== "object") {
+          continue;
+        }
+
+        const item = option as Record<string, unknown>;
+        const value = this.readFiniteNumber(item, ["Reward", "reward", "Credits", "credits", "Value", "value"]);
+        if (value !== null) {
+          candidates.push(value);
+        }
+      }
+    }
+
+    if (candidates.length === 0) {
+      return fallback;
+    }
+
+    return candidates.reduce((max, current) => (current > max ? current : max), candidates[0]);
+  }
+
+  private upsertMissionFromAccepted(data: Record<string, unknown>, timestamp: string): boolean {
+    const missionId = this.readMissionId(data);
+    if (missionId === null) {
+      return false;
+    }
+
+    const existing = this.missions.active.find((mission) => mission.missionId === missionId) ?? null;
+    const resolvedName = this.readString(data, ["Name", "name"], existing?.name ?? null);
+    const resolvedLocalizedName = this.readString(
+      data,
+      ["LocalisedName", "Name_Localised", "LocalizedName", "localizedName"],
+      existing?.localizedName ?? null
+    );
+    const derivedCommodity = this.extractCommodityFromMissionText(resolvedLocalizedName, resolvedName);
+    const acceptedAt = existing?.acceptedAt ?? timestamp;
+    const nextMission: MissionState = {
+      missionId,
+      name: resolvedName,
+      localizedName: resolvedLocalizedName,
+      faction: this.readString(data, ["Faction", "faction"], existing?.faction ?? null),
+      originSystem: this.readString(data, ["OriginSystem"], existing?.originSystem ?? this.location.starSystem),
+      originStation: this.readString(data, ["OriginStation"], existing?.originStation ?? this.location.stationName),
+      destinationSystem: this.readString(data, ["DestinationSystem"], existing?.destinationSystem ?? null),
+      destinationStation: this.readString(data, ["DestinationStation"], existing?.destinationStation ?? null),
+      targetFaction: this.readString(data, ["TargetFaction"], existing?.targetFaction ?? null),
+      targetType: this.readString(
+        data,
+        ["TargetType_Localised", "TargetType", "targetType"],
+        existing?.targetType ?? null
+      ),
+      commodity: this.readString(
+        data,
+        ["Commodity_Localised", "Commodity", "commodity"],
+        existing?.commodity ?? derivedCommodity.commodity
+      ),
+      commodityCount: this.readNumber(
+        data,
+        ["Count", "CommodityCount"],
+        existing?.commodityCount ?? derivedCommodity.commodityCount
+      ),
+      passengerCount: this.readNumber(data, ["PassengerCount"], existing?.passengerCount ?? null),
+      passengerType: this.readString(
+        data,
+        ["PassengerType_Localised", "PassengerType"],
+        existing?.passengerType ?? null
+      ),
+      influence: this.readString(data, ["Influence"], existing?.influence ?? null),
+      reputation: this.readString(data, ["Reputation"], existing?.reputation ?? null),
+      wing: this.readBoolean(data, ["Wing"], existing?.wing ?? false),
+      expiry: this.readString(data, ["Expiry"], existing?.expiry ?? null),
+      status: "active",
+      reward: this.extractMaxCreditsReward(data, existing?.reward ?? null),
+      rewards: existing?.rewards ?? [],
+      updatedAt: timestamp,
+      acceptedAt,
+      completedAt: null,
+      failedAt: null,
+      abandonedAt: null
+    };
+
+    return this.upsertActiveMission(nextMission, timestamp);
+  }
+
+  private updateMissionFromRedirected(data: Record<string, unknown>, timestamp: string): boolean {
+    const missionId = this.readMissionId(data);
+    if (missionId === null) {
+      return false;
+    }
+
+    const existing = this.missions.active.find((mission) => mission.missionId === missionId);
+    if (!existing) {
+      return false;
+    }
+
+    const nextMission: MissionState = {
+      ...existing,
+      destinationSystem: this.readString(
+        data,
+        ["NewDestinationSystem", "DestinationSystem"],
+        existing.destinationSystem
+      ),
+      destinationStation: this.readString(
+        data,
+        ["NewDestinationStation", "DestinationStation"],
+        existing.destinationStation
+      ),
+      updatedAt: timestamp
+    };
+
+    return this.upsertActiveMission(nextMission, timestamp);
+  }
+
+  private finishMission(
+    data: Record<string, unknown>,
+    status: "completed" | "failed" | "abandoned",
+    timestamp: string
+  ): boolean {
+    const missionId = this.readMissionId(data);
+    if (missionId === null) {
+      return false;
+    }
+
+    const index = this.missions.active.findIndex((mission) => mission.missionId === missionId);
+    const existing = index >= 0 ? this.missions.active[index] : null;
+    const acceptedAt = existing?.acceptedAt ?? null;
+
+    const finished: MissionState = {
+      missionId,
+      name: this.readString(data, ["Name", "name"], existing?.name ?? null),
+      localizedName: this.readString(
+        data,
+        ["LocalisedName", "Name_Localised", "LocalizedName", "localizedName"],
+        existing?.localizedName ?? null
+      ),
+      faction: existing?.faction ?? null,
+      originSystem: existing?.originSystem ?? null,
+      originStation: existing?.originStation ?? null,
+      destinationSystem: this.readString(data, ["DestinationSystem"], existing?.destinationSystem ?? null),
+      destinationStation: this.readString(data, ["DestinationStation"], existing?.destinationStation ?? null),
+      targetFaction: existing?.targetFaction ?? null,
+      targetType: existing?.targetType ?? null,
+      commodity: existing?.commodity ?? null,
+      commodityCount: existing?.commodityCount ?? null,
+      passengerCount: existing?.passengerCount ?? null,
+      passengerType: existing?.passengerType ?? null,
+      influence: existing?.influence ?? null,
+      reputation: existing?.reputation ?? null,
+      wing: existing?.wing ?? false,
+      expiry: existing?.expiry ?? null,
+      status,
+      reward: this.extractMaxCreditsReward(data, existing?.reward ?? null),
+      rewards: this.parseRewards(data),
+      updatedAt: timestamp,
+      acceptedAt,
+      completedAt: status === "completed" ? timestamp : null,
+      failedAt: status === "failed" ? timestamp : null,
+      abandonedAt: status === "abandoned" ? timestamp : null
+    };
+
+    if (index >= 0) {
+      this.missions.active.splice(index, 1);
+    }
+
+    this.missions.history = [
+      finished,
+      ...this.missions.history.filter((mission) => mission.missionId !== missionId)
+    ].slice(0, 200);
+    this.missions.updatedAt = timestamp;
+    return true;
+  }
+
+  private updateMissionFromCargoDepot(data: Record<string, unknown>, timestamp: string): boolean {
+    const missionId = this.readMissionId(data);
+    if (missionId === null) {
+      return false;
+    }
+
+    const existing = this.missions.active.find((mission) => mission.missionId === missionId) ?? null;
+    const totalItemsToDeliver = this.readNumber(
+      data,
+      ["TotalItemsToDeliver", "Count", "ItemsDelivered"],
+      existing?.commodityCount ?? null
+    );
+
+    const nextMission: MissionState = {
+      missionId,
+      name: existing?.name ?? null,
+      localizedName: existing?.localizedName ?? null,
+      faction: existing?.faction ?? null,
+      originSystem: existing?.originSystem ?? this.location.starSystem,
+      originStation: existing?.originStation ?? this.location.stationName,
+      destinationSystem: existing?.destinationSystem ?? null,
+      destinationStation: existing?.destinationStation ?? null,
+      targetFaction: existing?.targetFaction ?? null,
+      targetType: existing?.targetType ?? null,
+      commodity: this.readString(
+        data,
+        ["CargoType_Localised", "CargoType", "Commodity_Localised", "Commodity"],
+        existing?.commodity ?? null
+      ),
+      commodityCount: totalItemsToDeliver,
+      passengerCount: existing?.passengerCount ?? null,
+      passengerType: existing?.passengerType ?? null,
+      influence: existing?.influence ?? null,
+      reputation: existing?.reputation ?? null,
+      wing: existing?.wing ?? false,
+      expiry: existing?.expiry ?? null,
+      status: "active",
+      reward: existing?.reward ?? null,
+      rewards: existing?.rewards ?? [],
+      updatedAt: timestamp,
+      acceptedAt: existing?.acceptedAt ?? null,
+      completedAt: null,
+      failedAt: null,
+      abandonedAt: null
+    };
+
+    return this.upsertActiveMission(nextMission, timestamp);
+  }
+
+  private readColonizationNeeds(data: Record<string, unknown>): ColonizationCommodityNeed[] {
+    const rawResources = data.ResourcesRequired;
+    if (!Array.isArray(rawResources)) {
+      return [];
+    }
+
+    return rawResources
+      .filter((entry): entry is Record<string, unknown> => Boolean(entry && typeof entry === "object"))
+      .map((entry) => {
+        const requiredAmount = this.readNumber(entry, ["RequiredAmount"], null);
+        const providedAmount = this.readNumber(entry, ["ProvidedAmount"], null);
+        const remainingAmount = requiredAmount !== null
+          ? Math.max(0, requiredAmount - (providedAmount ?? 0))
+          : null;
+
+        return {
+          name: this.readString(entry, ["Name_Localised", "Name"], "Unknown") ?? "Unknown",
+          requiredAmount,
+          providedAmount,
+          remainingAmount,
+          payment: this.readNumber(entry, ["Payment"], null)
+        };
+      });
+  }
+
+  private updateColonizationFromConstructionDepot(data: Record<string, unknown>, timestamp: string): boolean {
+    const next: ColonizationState = {
+      ...this.colonization,
+      isColonizing: !this.readBoolean(data, ["ConstructionComplete"], false)
+        && !this.readBoolean(data, ["ConstructionFailed"], false),
+      systemName: this.location.starSystem ?? this.colonization.systemName,
+      marketId: this.readNumber(data, ["MarketID"], this.colonization.marketId),
+      constructionProgress: this.readNumber(data, ["ConstructionProgress"], this.colonization.constructionProgress),
+      constructionComplete: this.readBoolean(data, ["ConstructionComplete"], this.colonization.constructionComplete),
+      constructionFailed: this.readBoolean(data, ["ConstructionFailed"], this.colonization.constructionFailed),
+      requiredCommodities: this.readColonizationNeeds(data),
+      updatedAt: timestamp
+    };
+
+    const changed = JSON.stringify(next) !== JSON.stringify(this.colonization);
+    if (changed) {
+      this.colonization = next;
+    }
+
+    return changed;
+  }
+
+  private updateColonizationFromContribution(data: Record<string, unknown>, timestamp: string): boolean {
+    if (!this.colonization.isColonizing || this.colonization.requiredCommodities.length === 0) {
+      return false;
+    }
+
+    const contributionsRaw = data.Contributions;
+    if (!Array.isArray(contributionsRaw)) {
+      return false;
+    }
+
+    const nextNeeds = this.colonization.requiredCommodities.map((item) => ({ ...item }));
+    for (const entry of contributionsRaw) {
+      if (!entry || typeof entry !== "object") {
+        continue;
+      }
+
+      const raw = entry as Record<string, unknown>;
+      const name = this.readString(raw, ["Name_Localised", "Name"], null);
+      const amount = this.readNumber(raw, ["Amount"], null);
+      if (!name || amount === null || amount <= 0) {
+        continue;
+      }
+
+      const target = nextNeeds.find(
+        (need) => need.name.toLowerCase() === name.toLowerCase()
+      );
+      if (!target) {
+        continue;
+      }
+
+      const provided = (target.providedAmount ?? 0) + amount;
+      target.providedAmount = provided;
+      target.remainingAmount = target.requiredAmount !== null
+        ? Math.max(0, target.requiredAmount - provided)
+        : target.remainingAmount;
+    }
+
+    const next: ColonizationState = {
+      ...this.colonization,
+      requiredCommodities: nextNeeds,
+      updatedAt: timestamp
+    };
+
+    const changed = JSON.stringify(next) !== JSON.stringify(this.colonization);
+    if (changed) {
+      this.colonization = next;
+    }
+
+    return changed;
+  }
+
+  private syncActiveMissionsFromList(data: Record<string, unknown>, timestamp: string): boolean {
+    const activeRaw = data.Active;
+    if (!Array.isArray(activeRaw)) {
+      return false;
+    }
+
+    const missionRows = activeRaw
+      .map((entry): Record<string, unknown> | null => {
+        if (typeof entry === "number" && Number.isFinite(entry)) {
+          return { MissionID: entry };
+        }
+
+        if (entry && typeof entry === "object") {
+          return entry as Record<string, unknown>;
+        }
+
+        return null;
+      })
+      .filter((entry): entry is Record<string, unknown> => entry !== null);
+
+    const activeIds = missionRows
+      .map((entry) => this.readMissionId(entry))
+      .filter((missionId): missionId is number => missionId !== null);
+    const activeSet = new Set(activeIds);
+    const existingById = new Map(
+      this.missions.active
+        .filter((mission) => activeSet.has(mission.missionId))
+        .map((mission) => [mission.missionId, mission] as const)
+    );
+
+    const nextActive: MissionState[] = [];
+    for (const row of missionRows) {
+      const missionId = this.readMissionId(row);
+      if (missionId === null) {
+        continue;
+      }
+
+      const existing = existingById.get(missionId) ?? null;
+      const resolvedName = this.readString(row, ["Name", "name"], existing?.name ?? null);
+      const resolvedLocalizedName = this.readString(
+        row,
+        ["LocalisedName", "Name_Localised", "LocalizedName", "localizedName"],
+        existing?.localizedName ?? null
+      );
+      const derivedCommodity = this.extractCommodityFromMissionText(resolvedLocalizedName, resolvedName);
+      const merged: MissionState = {
+        missionId,
+        name: resolvedName,
+        localizedName: resolvedLocalizedName,
+        faction: this.readString(row, ["Faction", "faction"], existing?.faction ?? null),
+        originSystem: existing?.originSystem ?? this.location.starSystem,
+        originStation: existing?.originStation ?? this.location.stationName,
+        destinationSystem: this.readString(row, ["DestinationSystem"], existing?.destinationSystem ?? null),
+        destinationStation: this.readString(row, ["DestinationStation"], existing?.destinationStation ?? null),
+        targetFaction: this.readString(row, ["TargetFaction"], existing?.targetFaction ?? null),
+        targetType: this.readString(
+          row,
+          ["TargetType_Localised", "TargetType", "targetType"],
+          existing?.targetType ?? null
+        ),
+        commodity: this.readString(
+          row,
+          ["Commodity_Localised", "Commodity", "commodity"],
+          existing?.commodity ?? derivedCommodity.commodity
+        ),
+        commodityCount: this.readNumber(
+          row,
+          ["Count", "CommodityCount"],
+          existing?.commodityCount ?? derivedCommodity.commodityCount
+        ),
+        passengerCount: this.readNumber(row, ["PassengerCount"], existing?.passengerCount ?? null),
+        passengerType: this.readString(
+          row,
+          ["PassengerType_Localised", "PassengerType"],
+          existing?.passengerType ?? null
+        ),
+        influence: this.readString(row, ["Influence"], existing?.influence ?? null),
+        reputation: this.readString(row, ["Reputation"], existing?.reputation ?? null),
+        wing: this.readBoolean(row, ["Wing"], existing?.wing ?? false),
+        expiry: this.readString(row, ["Expiry"], existing?.expiry ?? null),
+        status: "active",
+        reward: this.extractMaxCreditsReward(row, existing?.reward ?? null),
+        rewards: existing?.rewards ?? [],
+        updatedAt: timestamp,
+        acceptedAt: existing?.acceptedAt ?? null,
+        completedAt: null,
+        failedAt: null,
+        abandonedAt: null
+      };
+
+      existingById.delete(missionId);
+      nextActive.push(merged);
+    }
+
+    if (JSON.stringify(nextActive) === JSON.stringify(this.missions.active)) {
+      return false;
+    }
+
+    this.missions.active = nextActive;
+    this.missions.updatedAt = timestamp;
+    return true;
+  }
+
+  private upsertActiveMission(mission: MissionState, timestamp: string): boolean {
+    const next = [...this.missions.active];
+    const index = next.findIndex((existing) => existing.missionId === mission.missionId);
+    if (index >= 0) {
+      next[index] = mission;
+    } else {
+      next.unshift(mission);
+    }
+
+    const changed = JSON.stringify(next) !== JSON.stringify(this.missions.active);
+    if (!changed) {
+      return false;
+    }
+
+    this.missions.active = next;
+    this.missions.updatedAt = timestamp;
+    return true;
   }
 
   private syncRoute(starSystem: string, timestamp: string): boolean {
@@ -501,6 +1168,21 @@ export class StateStore {
       legs: [...snapshot.route.legs],
       nextLeg: snapshot.route.nextLeg ? { ...snapshot.route.nextLeg } : null,
       previousLeg: snapshot.route.previousLeg ? { ...snapshot.route.previousLeg } : null
+    };
+    this.missions = {
+      updatedAt: snapshot.missions?.updatedAt ?? null,
+      active: (snapshot.missions?.active ?? []).map((mission) => this.cloneMission(mission)),
+      history: (snapshot.missions?.history ?? []).map((mission) => this.cloneMission(mission)).slice(0, 200)
+    };
+    this.colonization = {
+      isColonizing: snapshot.colonization?.isColonizing ?? false,
+      systemName: snapshot.colonization?.systemName ?? null,
+      marketId: snapshot.colonization?.marketId ?? null,
+      constructionProgress: snapshot.colonization?.constructionProgress ?? null,
+      constructionComplete: snapshot.colonization?.constructionComplete ?? false,
+      constructionFailed: snapshot.colonization?.constructionFailed ?? false,
+      requiredCommodities: (snapshot.colonization?.requiredCommodities ?? []).map((item) => ({ ...item })),
+      updatedAt: snapshot.colonization?.updatedAt ?? null
     };
   }
 }

@@ -120,6 +120,8 @@ export const settings = {
   apiKeyLabels,
   apiKeyPepper: process.env.API_KEY_PEPPER ?? "",
   bootstrapApiKeys: parseBoolean(process.env.BOOTSTRAP_API_KEYS, true),
+  autoProvisionDefaultApiKey: parseBoolean(process.env.AUTO_PROVISION_DEFAULT_API_KEY, true),
+  defaultApiKey: parseOptionalString(process.env.DEFAULT_API_KEY) ?? DEFAULT_API_KEY,
   adminApiKey: parseOptionalString(process.env.ADMIN_API_KEY),
   allowAnyApiKey: parseBoolean(process.env.ALLOW_ANY_API_KEY, false),
   corsOrigin: process.env.CORS_ORIGIN ?? "*",
