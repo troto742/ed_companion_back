@@ -1,4 +1,5 @@
 import { RouteLeg } from "../types/state";
+import { parseSpanshShipBuild } from "./spanshShipBuildParser";
 
 const SPANSH_BASE_URL = "https://spansh.co.uk";
 const DEFAULT_TIMEOUT_MS = 45_000;
@@ -47,6 +48,20 @@ export interface SpanshRouteResult {
   routeName: string;
   legs: RouteLeg[];
   previewRows: SpanshRoutePreviewRow[];
+}
+
+export interface SpanshExactRouteRequest {
+  sourceSystem: string;
+  destinationSystem: string;
+  shipBuild: string;
+  cargo: number;
+  fuelReserveSize: number;
+  useSupercharge: boolean;
+  useInjections: boolean;
+  excludeSecondary: boolean;
+  refuelEveryScoopable: boolean;
+  isSupercharged: boolean;
+  algorithm: "optimistic" | "guided" | "fuel" | "fuel_jumps" | "pessimistic";
 }
 
 const delay = async (ms: number): Promise<void> =>
@@ -133,4 +148,99 @@ export const generateSpanshRoute = async (
   }
 
   throw new Error("Spansh route generation timed out.");
+};
+
+export const generateSpanshExactRoute = async (
+  request: SpanshExactRouteRequest,
+  timeoutMs: number = DEFAULT_TIMEOUT_MS
+): Promise<SpanshRouteResult> => {
+  const ship = parseSpanshShipBuild(request.shipBuild);
+  const body = new URLSearchParams();
+  body.set("source", request.sourceSystem);
+  body.set("destination", request.destinationSystem);
+  body.set("ship_build", request.shipBuild);
+  body.set("cargo", String(request.cargo));
+  body.set("reserve_size", String(request.fuelReserveSize));
+  body.set("is_supercharged", request.isSupercharged ? "1" : "0");
+  body.set("use_supercharge", request.useSupercharge ? "1" : "0");
+  body.set("use_injections", request.useInjections ? "1" : "0");
+  body.set("exclude_secondary", request.excludeSecondary ? "1" : "0");
+  body.set("refuel_every_scoopable", request.refuelEveryScoopable ? "1" : "0");
+  body.set("algorithm", request.algorithm);
+  body.set("fuel_power", String(ship.fuelPower));
+  body.set("fuel_multiplier", String(ship.fuelMultiplier));
+  body.set("optimal_mass", String(ship.optimalMass));
+  body.set("base_mass", String(ship.baseMass));
+  body.set("tank_size", String(ship.tankSize));
+  body.set("internal_tank_size", String(ship.reservoirSize));
+  body.set("max_fuel_per_jump", String(ship.maxFuelPerJump));
+  body.set("range_boost", String(ship.rangeBoost));
+  body.set("supercharge_multiplier", String(ship.superchargeMultiplier));
+  body.set("injection_multiplier", String(ship.injectionMultiplier));
+
+  const submitResponse = await fetch(`${SPANSH_BASE_URL}/api/generic/route`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/x-www-form-urlencoded; charset=UTF-8"
+    },
+    body: body.toString()
+  });
+
+  if (!submitResponse.ok) {
+    const failedBody = await submitResponse.text();
+    throw new Error(`Spansh exact route request failed: ${failedBody}`);
+  }
+
+  const submittedJob = await submitResponse.json() as SpanshJobResponse;
+  if (!submittedJob.job) {
+    throw new Error("Spansh did not return a valid exact route job id.");
+  }
+
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const resultResponse = await fetch(`${SPANSH_BASE_URL}/api/results/${submittedJob.job}`);
+    if (!resultResponse.ok) {
+      throw new Error(`Spansh exact result request failed with HTTP ${resultResponse.status}.`);
+    }
+
+    const resultPayload = await resultResponse.json() as any;
+    if (resultPayload.status === "ok" && resultPayload.result) {
+      const jumps = Array.isArray(resultPayload.result.jumps) ? resultPayload.result.jumps : [];
+      if (jumps.length === 0) {
+        throw new Error(resultPayload.result.reason || "Spansh exact route returned no jumps.");
+      }
+
+      const legs: RouteLeg[] = jumps.map((jump: any) => ({
+        systemName: jump.name,
+        distance: Number.isFinite(jump.distance) ? jump.distance : null,
+        distanceRemaining: Number.isFinite(jump.distance_to_destination) ? jump.distance_to_destination : null,
+        fuelLeft: Number.isFinite(jump.fuel_in_tank) ? jump.fuel_in_tank : null,
+        fuelUsed: Number.isFinite(jump.fuel_used) ? jump.fuel_used : null,
+        refuel: jump.must_refuel === true,
+        neutronStar: jump.has_neutron === true
+      }));
+
+      const previewRows: SpanshRoutePreviewRow[] = jumps.map((jump: any, index: number) => ({
+        systemName: jump.name,
+        distance: Number.isFinite(jump.distance) ? jump.distance : null,
+        distanceRemaining: Number.isFinite(jump.distance_to_destination) ? jump.distance_to_destination : null,
+        estimatedJumps: jumps.length - index - 1,
+        neutronStar: jump.has_neutron === true
+      }));
+
+      return {
+        routeName: `${request.sourceSystem} -> ${request.destinationSystem} (Exact)`,
+        legs,
+        previewRows
+      };
+    }
+
+    if (resultPayload.status === "error") {
+      throw new Error(resultPayload.error || "Spansh could not generate an exact route.");
+    }
+
+    await delay(POLL_INTERVAL_MS);
+  }
+
+  throw new Error("Spansh exact route generation timed out.");
 };

@@ -5,7 +5,7 @@ import { z } from "zod";
 import { PersistenceStore } from "../db/postgresPersistence";
 import { getApiAuthFromRequest, getApiKeyFromRequest } from "../middleware/apiKey";
 import { parseRouteFile } from "../services/routeParser";
-import { generateSpanshRoute } from "../services/spanshRouteService";
+import { generateSpanshExactRoute, generateSpanshRoute } from "../services/spanshRouteService";
 import { TenantRuntime } from "../state/runtimeRegistry";
 import { RouteLeg, StateChangeSet } from "../types/state";
 
@@ -24,6 +24,20 @@ const spanshRouteSchema = z.object({
   jumpRange: z.coerce.number().positive("Jump range must be greater than zero."),
   efficiency: z.coerce.number().min(1, "Efficiency must be between 1 and 100.").max(100, "Efficiency must be between 1 and 100.").default(25),
   via: z.array(z.string().trim().min(1)).max(20).optional().default([])
+});
+
+const spanshExactRouteSchema = z.object({
+  sourceSystem: z.string().trim().min(1, "Source system is required."),
+  destinationSystem: z.string().trim().min(1, "Destination system is required."),
+  shipBuild: z.string().trim().min(1, "Ship build is required."),
+  cargo: z.coerce.number().min(0).default(0),
+  fuelReserveSize: z.coerce.number().min(0).default(0),
+  useSupercharge: z.coerce.boolean().default(true),
+  useInjections: z.coerce.boolean().default(false),
+  excludeSecondary: z.coerce.boolean().default(false),
+  refuelEveryScoopable: z.coerce.boolean().default(true),
+  isSupercharged: z.coerce.boolean().default(false),
+  algorithm: z.enum(["optimistic", "guided", "fuel", "fuel_jumps", "pessimistic"]).default("optimistic")
 });
 
 export const createRouteRoutes = (dependencies: RouteRouteDependencies): Router => {
@@ -96,6 +110,48 @@ export const createRouteRoutes = (dependencies: RouteRouteDependencies): Router 
 
       try {
         const generatedRoute = await generateSpanshRoute(parsedRequest.data);
+        const changes = runtime.store.loadRoute(generatedRoute.routeName, generatedRoute.legs, new Date().toISOString());
+
+        if (persistence) {
+          await persistence.persistRoute(
+            runtime.commanderName,
+            generatedRoute.routeName,
+            generatedRoute.legs,
+            runtime.store.getSnapshot()
+          );
+        }
+
+        onStateChanged(runtime, changes);
+        response.status(201).json({
+          routeLoaded: true,
+          routeName: generatedRoute.routeName,
+          legs: generatedRoute.legs.length,
+          previewRows: generatedRoute.previewRows
+        });
+      } catch (error) {
+        runtime.store.restoreCheckpoint(checkpoint);
+        throw error;
+      }
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post("/spansh/exact", async (request, response, next) => {
+    const parsedRequest = spanshExactRouteSchema.safeParse(request.body);
+    if (!parsedRequest.success) {
+      response.status(400).json({ error: parsedRequest.error.issues[0]?.message ?? "Invalid Spansh exact route request." });
+      return;
+    }
+
+    try {
+      const authContext = getApiAuthFromRequest(request);
+      const apiKey = authContext?.apiKey ?? getApiKeyFromRequest(request);
+      const runtime = await resolveRuntime(apiKey, authContext?.tenantLabel, authContext?.keyFingerprint);
+      const checkpoint = runtime.store.createCheckpoint();
+
+      try {
+        const generatedRoute = await generateSpanshExactRoute(parsedRequest.data);
         const changes = runtime.store.loadRoute(generatedRoute.routeName, generatedRoute.legs, new Date().toISOString());
 
         if (persistence) {
