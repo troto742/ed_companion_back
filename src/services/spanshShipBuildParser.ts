@@ -214,14 +214,16 @@ const parseSlef = (configStruct: UnknownRecord): SpanshShipProfile => {
     (candidate: UnknownRecord) => candidate.symbol.toLowerCase() === String(fsd.Item).toLowerCase()
   );
   const fsdOverride = SLEF_FSD_OVERRIDES[String(fsd.Item).toLowerCase()];
-  const fsdProfile: SLEFFrameShiftDriveProfile | null = fsdModule
-    ? {
-        fuelmul: fsdModule.fuelmul,
-        fuelpower: fsdModule.fuelpower,
-        optmass: fsdModule.optmass,
-        maxfuel: fsdModule.maxfuel,
-      }
-    : fsdOverride ?? null;
+  const fsdProfile: SLEFFrameShiftDriveProfile | null = fsdOverride ?? (
+    fsdModule
+      ? {
+          fuelmul: fsdModule.fuelmul,
+          fuelpower: fsdModule.fuelpower,
+          optmass: fsdModule.optmass,
+          maxfuel: fsdModule.maxfuel,
+        }
+      : null
+  );
 
   if (!fsdProfile) {
     throw new Error("Could not resolve FSD module from SLEF build.");
