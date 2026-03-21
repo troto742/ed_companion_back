@@ -84,6 +84,43 @@ const SLEF_FSD_OVERRIDES: Record<string, SLEFFrameShiftDriveProfile> = {
 
 const asArray = <T>(value: T | T[]): T[] => Array.isArray(value) ? value : [value];
 
+const normalizeSymbol = (value: unknown): string | null =>
+  typeof value === "string" && value.trim() ? value.trim().toLowerCase() : null;
+
+const findMatchingFsdOverride = (value: unknown): SLEFFrameShiftDriveProfile | null => {
+  const normalized = normalizeSymbol(value);
+  if (!normalized) {
+    return null;
+  }
+
+  return SLEF_FSD_OVERRIDES[normalized] ?? null;
+};
+
+const findCoriolisFsdOverride = (fsd: UnknownRecord): SLEFFrameShiftDriveProfile | null => {
+  const directCandidates = [
+    fsd.symbol,
+    fsd.module,
+    fsd.edName,
+    fsd.eddbId,
+    fsd.name,
+    fsd.grp,
+    fsd.mount,
+    fsd?.module?.symbol,
+    fsd?.module?.name,
+  ];
+
+  for (const candidate of directCandidates) {
+    const override = findMatchingFsdOverride(candidate);
+    if (override) {
+      return override;
+    }
+  }
+
+  const serialized = JSON.stringify(fsd).toLowerCase();
+  const matchingKey = Object.keys(SLEF_FSD_OVERRIDES).find((key) => serialized.includes(key));
+  return matchingKey ? SLEF_FSD_OVERRIDES[matchingKey] : null;
+};
+
 const calculateReservoirSize = (shipName: string): number =>
   RESERVOIR_SIZES[shipName] ?? 0;
 
@@ -98,19 +135,28 @@ const parseCoriolis = (configStruct: UnknownRecord): SpanshShipProfile => {
   }
 
   const fsd = configStruct.components.standard.frameShiftDrive;
+  const fsdOverride = findCoriolisFsdOverride(fsd);
   const fsdModule = FRAME_SHIFT_DRIVES.find(
     (candidate: UnknownRecord) => candidate.class === fsd.class && candidate.rating === fsd.rating
   );
 
-  if (!fsdModule) {
+  if (!fsdModule && !fsdOverride) {
     throw new Error("Could not resolve FSD module from Coriolis build.");
   }
 
-  let optimalMass = fsdModule.optmass;
-  let maxFuelPerJump = fsdModule.maxfuel;
+  let optimalMass = fsdOverride?.optmass ?? fsdModule!.optmass;
+  let maxFuelPerJump = fsdOverride?.maxfuel ?? fsdModule!.maxfuel;
+  const fuelMultiplier = fsdOverride?.fuelmul ?? fsdModule!.fuelmul;
+  const fuelPower = fsdOverride?.fuelpower ?? fsdModule!.fuelpower;
+  const superchargeMultiplier = fsdOverride?.superchargeMultiplier ?? 4;
+  const injectionMultiplier = fsdOverride?.injectionMultiplier ?? 2;
 
   if (fsd.modifications?.optmass) {
     optimalMass *= 1 + fsd.modifications.optmass / 10_000;
+  }
+
+  if (fsd.modifications?.maxfuel) {
+    maxFuelPerJump *= 1 + fsd.modifications.maxfuel / 10_000;
   }
 
   if (fsd.blueprint?.special?.edname) {
@@ -141,15 +187,15 @@ const parseCoriolis = (configStruct: UnknownRecord): SpanshShipProfile => {
 
   return {
     baseMass: configStruct.stats.unladenMass + reservoirSize,
-    fuelMultiplier: fsdModule.fuelmul,
-    fuelPower: fsdModule.fuelpower,
+    fuelMultiplier,
+    fuelPower,
     tankSize: configStruct.stats.fuelCapacity,
     reservoirSize,
     rangeBoost,
     optimalMass,
     maxFuelPerJump,
-    superchargeMultiplier: 4,
-    injectionMultiplier: 2,
+    superchargeMultiplier,
+    injectionMultiplier,
   };
 };
 

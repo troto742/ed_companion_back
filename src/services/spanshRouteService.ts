@@ -20,6 +20,7 @@ export interface SpanshRoutePreviewRow {
   distance: number | null;
   distanceRemaining: number | null;
   estimatedJumps: number | null;
+  refuel: boolean;
   neutronStar: boolean;
 }
 
@@ -105,6 +106,7 @@ const mapSystemJumpToPreviewRow = (jump: SpanshResultSystemJump): SpanshRoutePre
   distance: Number.isFinite(jump.distance_jumped) ? jump.distance_jumped : null,
   distanceRemaining: Number.isFinite(jump.distance_left) ? jump.distance_left : null,
   estimatedJumps: Number.isFinite(jump.jumps) ? jump.jumps : null,
+  refuel: false,
   neutronStar: jump.neutron_star === true
 });
 
@@ -264,6 +266,7 @@ export const generateSpanshExactRoute = async (
     distance: Number.isFinite(jump.distance) ? jump.distance : null,
     distanceRemaining: Number.isFinite(jump.distance_to_destination) ? jump.distance_to_destination : null,
     estimatedJumps: jumps.length - index - 1,
+    refuel: jump.must_refuel === true,
     neutronStar: jump.has_neutron === true
   }));
 
