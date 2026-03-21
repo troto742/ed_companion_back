@@ -2,8 +2,10 @@ import { RouteLeg } from "../types/state";
 import { parseSpanshShipBuild } from "./spanshShipBuildParser";
 
 const SPANSH_BASE_URL = "https://spansh.co.uk";
-const DEFAULT_TIMEOUT_MS = 45_000;
-const POLL_INTERVAL_MS = 1_000;
+const DEFAULT_ROUTE_TIMEOUT_MS = 45_000;
+const DEFAULT_EXACT_ROUTE_TIMEOUT_MS = 5 * 60_000;
+const INITIAL_POLL_INTERVAL_MS = 1_000;
+const MAX_POLL_INTERVAL_MS = 5_000;
 
 export interface SpanshRouteRequest {
   sourceSystem: string;
@@ -40,6 +42,25 @@ interface SpanshResultPayload {
     source_system: string;
     destination_system: string;
     system_jumps: SpanshResultSystemJump[];
+  };
+  error?: string;
+}
+
+interface SpanshExactJump {
+  name: string;
+  distance: number;
+  distance_to_destination: number;
+  fuel_in_tank: number;
+  fuel_used: number;
+  must_refuel: boolean;
+  has_neutron: boolean;
+}
+
+interface SpanshExactResultPayload {
+  status: string;
+  result?: {
+    jumps?: SpanshExactJump[];
+    reason?: string;
   };
   error?: string;
 }
@@ -87,9 +108,39 @@ const mapSystemJumpToPreviewRow = (jump: SpanshResultSystemJump): SpanshRoutePre
   neutronStar: jump.neutron_star === true
 });
 
+const pollSpanshJob = async <TResult extends { status: string; error?: string }>(
+  jobId: string,
+  timeoutMs: number,
+  buildPendingError: () => string
+): Promise<TResult> => {
+  const startedAt = Date.now();
+  let pollIntervalMs = INITIAL_POLL_INTERVAL_MS;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const resultResponse = await fetch(`${SPANSH_BASE_URL}/api/results/${jobId}`);
+    if (!resultResponse.ok) {
+      throw new Error(`Spansh result request failed with HTTP ${resultResponse.status}.`);
+    }
+
+    const resultPayload = await resultResponse.json() as TResult;
+    if (resultPayload.status === "ok") {
+      return resultPayload;
+    }
+
+    if (resultPayload.status === "error") {
+      throw new Error(resultPayload.error || "Spansh job failed.");
+    }
+
+    await delay(pollIntervalMs);
+    pollIntervalMs = Math.min(pollIntervalMs + 500, MAX_POLL_INTERVAL_MS);
+  }
+
+  throw new Error(buildPendingError());
+};
+
 export const generateSpanshRoute = async (
   request: SpanshRouteRequest,
-  timeoutMs: number = DEFAULT_TIMEOUT_MS
+  timeoutMs: number = DEFAULT_ROUTE_TIMEOUT_MS
 ): Promise<SpanshRouteResult> => {
   const body = new URLSearchParams();
   body.set("from", request.sourceSystem);
@@ -118,41 +169,32 @@ export const generateSpanshRoute = async (
     throw new Error("Spansh did not return a valid route job id.");
   }
 
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const resultResponse = await fetch(`${SPANSH_BASE_URL}/api/results/${submittedJob.job}`);
-    if (!resultResponse.ok) {
-      throw new Error(`Spansh result request failed with HTTP ${resultResponse.status}.`);
-    }
+  const resultPayload = await pollSpanshJob<SpanshResultPayload>(
+    submittedJob.job,
+    timeoutMs,
+    () => "Spansh route generation timed out."
+  );
 
-    const resultPayload = await resultResponse.json() as SpanshResultPayload;
-    if (resultPayload.status === "ok" && resultPayload.result) {
-      const { result } = resultPayload;
-      const legs = result.system_jumps.map(mapSystemJumpToLeg);
-      if (legs.length === 0) {
-        throw new Error("Spansh returned an empty route.");
-      }
-
-      return {
-        routeName: `${result.source_system} -> ${result.destination_system}`,
-        legs,
-        previewRows: result.system_jumps.map(mapSystemJumpToPreviewRow)
-      };
-    }
-
-    if (resultPayload.status === "error") {
-      throw new Error(resultPayload.error || "Spansh could not generate a route.");
-    }
-
-    await delay(POLL_INTERVAL_MS);
+  if (!resultPayload.result) {
+    throw new Error("Spansh returned no route payload.");
   }
 
-  throw new Error("Spansh route generation timed out.");
+  const { result } = resultPayload;
+  const legs = result.system_jumps.map(mapSystemJumpToLeg);
+  if (legs.length === 0) {
+    throw new Error("Spansh returned an empty route.");
+  }
+
+  return {
+    routeName: `${result.source_system} -> ${result.destination_system}`,
+    legs,
+    previewRows: result.system_jumps.map(mapSystemJumpToPreviewRow)
+  };
 };
 
 export const generateSpanshExactRoute = async (
   request: SpanshExactRouteRequest,
-  timeoutMs: number = DEFAULT_TIMEOUT_MS
+  timeoutMs: number = DEFAULT_EXACT_ROUTE_TIMEOUT_MS
 ): Promise<SpanshRouteResult> => {
   const ship = parseSpanshShipBuild(request.shipBuild);
   const body = new URLSearchParams();
@@ -196,51 +238,38 @@ export const generateSpanshExactRoute = async (
     throw new Error("Spansh did not return a valid exact route job id.");
   }
 
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const resultResponse = await fetch(`${SPANSH_BASE_URL}/api/results/${submittedJob.job}`);
-    if (!resultResponse.ok) {
-      throw new Error(`Spansh exact result request failed with HTTP ${resultResponse.status}.`);
-    }
+  const resultPayload = await pollSpanshJob<SpanshExactResultPayload>(
+    submittedJob.job,
+    timeoutMs,
+    () => "Spansh exact route generation timed out after 5 minutes. Long-range exact routes can take substantially longer on Spansh."
+  );
 
-    const resultPayload = await resultResponse.json() as any;
-    if (resultPayload.status === "ok" && resultPayload.result) {
-      const jumps = Array.isArray(resultPayload.result.jumps) ? resultPayload.result.jumps : [];
-      if (jumps.length === 0) {
-        throw new Error(resultPayload.result.reason || "Spansh exact route returned no jumps.");
-      }
-
-      const legs: RouteLeg[] = jumps.map((jump: any) => ({
-        systemName: jump.name,
-        distance: Number.isFinite(jump.distance) ? jump.distance : null,
-        distanceRemaining: Number.isFinite(jump.distance_to_destination) ? jump.distance_to_destination : null,
-        fuelLeft: Number.isFinite(jump.fuel_in_tank) ? jump.fuel_in_tank : null,
-        fuelUsed: Number.isFinite(jump.fuel_used) ? jump.fuel_used : null,
-        refuel: jump.must_refuel === true,
-        neutronStar: jump.has_neutron === true
-      }));
-
-      const previewRows: SpanshRoutePreviewRow[] = jumps.map((jump: any, index: number) => ({
-        systemName: jump.name,
-        distance: Number.isFinite(jump.distance) ? jump.distance : null,
-        distanceRemaining: Number.isFinite(jump.distance_to_destination) ? jump.distance_to_destination : null,
-        estimatedJumps: jumps.length - index - 1,
-        neutronStar: jump.has_neutron === true
-      }));
-
-      return {
-        routeName: `${request.sourceSystem} -> ${request.destinationSystem} (Exact)`,
-        legs,
-        previewRows
-      };
-    }
-
-    if (resultPayload.status === "error") {
-      throw new Error(resultPayload.error || "Spansh could not generate an exact route.");
-    }
-
-    await delay(POLL_INTERVAL_MS);
+  const jumps = Array.isArray(resultPayload.result?.jumps) ? resultPayload.result.jumps : [];
+  if (jumps.length === 0) {
+    throw new Error(resultPayload.result?.reason || "Spansh exact route returned no jumps.");
   }
 
-  throw new Error("Spansh exact route generation timed out.");
+  const legs: RouteLeg[] = jumps.map((jump) => ({
+    systemName: jump.name,
+    distance: Number.isFinite(jump.distance) ? jump.distance : null,
+    distanceRemaining: Number.isFinite(jump.distance_to_destination) ? jump.distance_to_destination : null,
+    fuelLeft: Number.isFinite(jump.fuel_in_tank) ? jump.fuel_in_tank : null,
+    fuelUsed: Number.isFinite(jump.fuel_used) ? jump.fuel_used : null,
+    refuel: jump.must_refuel === true,
+    neutronStar: jump.has_neutron === true
+  }));
+
+  const previewRows: SpanshRoutePreviewRow[] = jumps.map((jump, index) => ({
+    systemName: jump.name,
+    distance: Number.isFinite(jump.distance) ? jump.distance : null,
+    distanceRemaining: Number.isFinite(jump.distance_to_destination) ? jump.distance_to_destination : null,
+    estimatedJumps: jumps.length - index - 1,
+    neutronStar: jump.has_neutron === true
+  }));
+
+  return {
+    routeName: `${request.sourceSystem} -> ${request.destinationSystem} (Exact)`,
+    legs,
+    previewRows
+  };
 };
