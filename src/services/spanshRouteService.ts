@@ -6,6 +6,7 @@ const DEFAULT_ROUTE_TIMEOUT_MS = 45_000;
 const DEFAULT_EXACT_ROUTE_TIMEOUT_MS = 5 * 60_000;
 const INITIAL_POLL_INTERVAL_MS = 1_000;
 const MAX_POLL_INTERVAL_MS = 5_000;
+const MAX_BODY_SEARCH_PAGE_SIZE = 500;
 
 export interface SpanshRouteRequest {
   sourceSystem: string;
@@ -86,10 +87,80 @@ export interface SpanshExactRouteRequest {
   algorithm: "optimistic" | "guided" | "fuel" | "fuel_jumps" | "pessimistic";
 }
 
+export interface SpanshExobiologyRouteRequest {
+  search: Record<string, unknown>;
+  reference?: {
+    id64?: number | string;
+    name?: string;
+    x?: number;
+    y?: number;
+    z?: number;
+  };
+  searchReference?: string;
+}
+
+interface SpanshBodySearchReference {
+  name?: string;
+}
+
+interface SpanshBodySearchResult {
+  system_name?: string;
+  distance?: number;
+}
+
+interface SpanshBodySearchPagePayload {
+  count?: number;
+  from?: number;
+  size?: number;
+  search_reference?: string;
+  reference?: SpanshBodySearchReference;
+  results?: SpanshBodySearchResult[];
+}
+
 const delay = async (ms: number): Promise<void> =>
   new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const toFiniteNumberOrNull = (value: unknown): number | null =>
+  typeof value === "number" && Number.isFinite(value) ? value : null;
+
+const fetchBodySearchPage = async (
+  search: Record<string, unknown>,
+  page: number,
+  size: number
+): Promise<Required<Pick<SpanshBodySearchPagePayload, "count" | "from" | "size" | "results">>> => {
+  const body = {
+    ...search,
+    page: Math.max(0, Math.trunc(page)),
+    size: Math.min(MAX_BODY_SEARCH_PAGE_SIZE, Math.max(1, Math.trunc(size)))
+  };
+
+  const response = await fetch(`${SPANSH_BASE_URL}/api/bodies/search`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Spansh exobiology bulk search failed with HTTP ${response.status}.`);
+  }
+
+  const payload = await response.json() as SpanshBodySearchPagePayload;
+  const results = Array.isArray(payload.results) ? payload.results : [];
+
+  return {
+    count: toFiniteNumberOrNull(payload.count) ?? results.length,
+    from: toFiniteNumberOrNull(payload.from) ?? 0,
+    size: toFiniteNumberOrNull(payload.size) ?? results.length,
+    results
+  };
+};
 
 const mapSystemJumpToLeg = (jump: SpanshResultSystemJump): RouteLeg => ({
   systemName: jump.system,
@@ -272,6 +343,90 @@ export const generateSpanshExactRoute = async (
 
   return {
     routeName: `${request.sourceSystem} -> ${request.destinationSystem} (Exact)`,
+    legs,
+    previewRows
+  };
+};
+
+export const generateSpanshExobiologyRoute = async (
+  request: SpanshExobiologyRouteRequest
+): Promise<SpanshRouteResult> => {
+  if (!isRecord(request.search)) {
+    throw new Error("Spansh exobiology search payload is required.");
+  }
+
+  // Keep the user filters, but force larger page size for efficient bulk import.
+  const pageSize = MAX_BODY_SEARCH_PAGE_SIZE;
+
+  const firstPage = await fetchBodySearchPage(request.search, 0, pageSize);
+  const totalRows = Math.max(0, firstPage.count);
+  if (totalRows === 0 && firstPage.results.length === 0) {
+    throw new Error("Spansh exobiology search returned no results.");
+  }
+
+  const uniqueSystems: Array<{ systemName: string; distance: number | null }> = [];
+  const seenSystems = new Set<string>();
+  const tryAppendPage = (rows: SpanshBodySearchResult[]): void => {
+    for (const row of rows) {
+      const systemName = typeof row.system_name === "string" ? row.system_name.trim() : "";
+      if (!systemName) {
+        continue;
+      }
+
+      const normalizedSystem = systemName.toLowerCase();
+      if (seenSystems.has(normalizedSystem)) {
+        continue;
+      }
+
+      seenSystems.add(normalizedSystem);
+      uniqueSystems.push({
+        systemName,
+        distance: toFiniteNumberOrNull(row.distance)
+      });
+    }
+  };
+
+  const totalPages = Math.max(1, Math.ceil(Math.max(totalRows, firstPage.results.length) / pageSize));
+  for (let page = 0; page < totalPages; page += 1) {
+    const pagePayload = page === 0
+      ? firstPage
+      : await fetchBodySearchPage(request.search, page, pageSize);
+    tryAppendPage(pagePayload.results);
+  }
+
+  if (uniqueSystems.length === 0) {
+    throw new Error("Spansh exobiology search did not contain valid system rows.");
+  }
+
+  const legs: RouteLeg[] = uniqueSystems.map((system) => ({
+    systemName: system.systemName,
+    distance: system.distance,
+    distanceRemaining: null,
+    fuelLeft: null,
+    fuelUsed: null,
+    refuel: false,
+    neutronStar: false
+  }));
+
+  const previewRows: SpanshRoutePreviewRow[] = uniqueSystems.map((system, index) => ({
+    systemName: system.systemName,
+    distance: system.distance,
+    distanceRemaining: null,
+    estimatedJumps: uniqueSystems.length - index - 1,
+    refuel: false,
+    neutronStar: false
+  }));
+
+  const referenceSystemValue = typeof request.search.reference_system === "string"
+    ? request.search.reference_system.trim()
+    : "";
+  const routeLabel = referenceSystemValue
+    || request.reference?.name?.trim()
+    || request.searchReference?.trim()
+    || "Filtered search";
+
+  return {
+    routeName: `Exobiology ${routeLabel}`,
     legs,
     previewRows
   };
