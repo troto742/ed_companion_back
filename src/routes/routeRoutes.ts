@@ -275,7 +275,8 @@ export const createRouteRoutes = (dependencies: RouteRouteDependencies): Router 
           routeLoaded: true,
           routeName: generatedRoute.routeName,
           legs: generatedRoute.legs.length,
-          previewRows: generatedRoute.previewRows
+          previewRows: generatedRoute.previewRows,
+          exobiologySystems: generatedRoute.exobiologySystems ?? []
         });
       } catch (error) {
         runtime.store.restoreCheckpoint(checkpoint);

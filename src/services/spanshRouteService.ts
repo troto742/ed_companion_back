@@ -25,6 +25,20 @@ export interface SpanshRoutePreviewRow {
   neutronStar: boolean;
 }
 
+export interface SpanshExobiologyBodyCandidate {
+  bodyName: string;
+  distanceToArrivalLs: number | null;
+  subtype: string | null;
+  atmosphere: string | null;
+}
+
+export interface SpanshExobiologySystemCandidate {
+  systemName: string;
+  distanceLy: number | null;
+  nearestBodyLs: number | null;
+  bodies: SpanshExobiologyBodyCandidate[];
+}
+
 interface SpanshJobResponse {
   job: string;
   status: string;
@@ -71,6 +85,7 @@ export interface SpanshRouteResult {
   routeName: string;
   legs: RouteLeg[];
   previewRows: SpanshRoutePreviewRow[];
+  exobiologySystems?: SpanshExobiologySystemCandidate[];
 }
 
 export interface SpanshExactRouteRequest {
@@ -104,8 +119,12 @@ interface SpanshBodySearchReference {
 }
 
 interface SpanshBodySearchResult {
+  name?: string;
   system_name?: string;
   distance?: number;
+  distance_to_arrival?: number;
+  subtype?: string;
+  atmosphere?: string;
 }
 
 interface SpanshBodySearchPagePayload {
@@ -364,8 +383,14 @@ export const generateSpanshExobiologyRoute = async (
     throw new Error("Spansh exobiology search returned no results.");
   }
 
-  const uniqueSystems: Array<{ systemName: string; distance: number | null }> = [];
-  const seenSystems = new Set<string>();
+  interface MutableSystemCandidate {
+    systemName: string;
+    distanceLy: number | null;
+    nearestBodyLs: number | null;
+    bodiesByName: Map<string, SpanshExobiologyBodyCandidate>;
+  }
+
+  const systemsByName = new Map<string, MutableSystemCandidate>();
   const tryAppendPage = (rows: SpanshBodySearchResult[]): void => {
     for (const row of rows) {
       const systemName = typeof row.system_name === "string" ? row.system_name.trim() : "";
@@ -374,15 +399,52 @@ export const generateSpanshExobiologyRoute = async (
       }
 
       const normalizedSystem = systemName.toLowerCase();
-      if (seenSystems.has(normalizedSystem)) {
-        continue;
+      const distanceLy = toFiniteNumberOrNull(row.distance);
+      const distanceToArrivalLs = toFiniteNumberOrNull(row.distance_to_arrival);
+      const bodyName = typeof row.name === "string" ? row.name.trim() : "";
+      const bodySubtype = typeof row.subtype === "string" ? row.subtype.trim() : "";
+      const bodyAtmosphere = typeof row.atmosphere === "string" ? row.atmosphere.trim() : "";
+
+      const existingSystem = systemsByName.get(normalizedSystem);
+      const systemCandidate: MutableSystemCandidate = existingSystem ?? {
+        systemName,
+        distanceLy,
+        nearestBodyLs: distanceToArrivalLs,
+        bodiesByName: new Map<string, SpanshExobiologyBodyCandidate>()
+      };
+
+      if (distanceLy !== null && (systemCandidate.distanceLy === null || distanceLy < systemCandidate.distanceLy)) {
+        systemCandidate.distanceLy = distanceLy;
       }
 
-      seenSystems.add(normalizedSystem);
-      uniqueSystems.push({
-        systemName,
-        distance: toFiniteNumberOrNull(row.distance)
-      });
+      if (distanceToArrivalLs !== null && (systemCandidate.nearestBodyLs === null || distanceToArrivalLs < systemCandidate.nearestBodyLs)) {
+        systemCandidate.nearestBodyLs = distanceToArrivalLs;
+      }
+
+      if (bodyName) {
+        const normalizedBodyName = bodyName.toLowerCase();
+        const existingBody = systemCandidate.bodiesByName.get(normalizedBodyName);
+        if (!existingBody) {
+          systemCandidate.bodiesByName.set(normalizedBodyName, {
+            bodyName,
+            distanceToArrivalLs,
+            subtype: bodySubtype || null,
+            atmosphere: bodyAtmosphere || null
+          });
+        } else {
+          if (distanceToArrivalLs !== null && (existingBody.distanceToArrivalLs === null || distanceToArrivalLs < existingBody.distanceToArrivalLs)) {
+            existingBody.distanceToArrivalLs = distanceToArrivalLs;
+          }
+          if (!existingBody.subtype && bodySubtype) {
+            existingBody.subtype = bodySubtype;
+          }
+          if (!existingBody.atmosphere && bodyAtmosphere) {
+            existingBody.atmosphere = bodyAtmosphere;
+          }
+        }
+      }
+
+      systemsByName.set(normalizedSystem, systemCandidate);
     }
   };
 
@@ -394,9 +456,69 @@ export const generateSpanshExobiologyRoute = async (
     tryAppendPage(pagePayload.results);
   }
 
-  if (uniqueSystems.length === 0) {
+  const exobiologySystems: SpanshExobiologySystemCandidate[] = Array.from(systemsByName.values()).map((system) => {
+    const bodies = Array.from(system.bodiesByName.values()).sort((left, right) => {
+      const leftLs = left.distanceToArrivalLs;
+      const rightLs = right.distanceToArrivalLs;
+
+      if (leftLs === null && rightLs === null) {
+        return left.bodyName.localeCompare(right.bodyName);
+      }
+      if (leftLs === null) {
+        return 1;
+      }
+      if (rightLs === null) {
+        return -1;
+      }
+
+      return leftLs - rightLs;
+    });
+
+    const nearestBodyLs = system.nearestBodyLs ?? bodies.find((body) => body.distanceToArrivalLs !== null)?.distanceToArrivalLs ?? null;
+
+    return {
+      systemName: system.systemName,
+      distanceLy: system.distanceLy,
+      nearestBodyLs,
+      bodies
+    };
+  }).sort((left, right) => {
+    const leftLy = left.distanceLy;
+    const rightLy = right.distanceLy;
+
+    if (leftLy === null && rightLy !== null) {
+      return 1;
+    }
+    if (leftLy !== null && rightLy === null) {
+      return -1;
+    }
+    if (leftLy !== null && rightLy !== null && leftLy !== rightLy) {
+      return leftLy - rightLy;
+    }
+
+    const leftLs = left.nearestBodyLs;
+    const rightLs = right.nearestBodyLs;
+    if (leftLs === null && rightLs !== null) {
+      return 1;
+    }
+    if (leftLs !== null && rightLs === null) {
+      return -1;
+    }
+    if (leftLs !== null && rightLs !== null && leftLs !== rightLs) {
+      return leftLs - rightLs;
+    }
+
+    return left.systemName.localeCompare(right.systemName);
+  });
+
+  if (exobiologySystems.length === 0) {
     throw new Error("Spansh exobiology search did not contain valid system rows.");
   }
+
+  const uniqueSystems = exobiologySystems.map((system) => ({
+    systemName: system.systemName,
+    distance: system.distanceLy
+  }));
 
   const legs: RouteLeg[] = uniqueSystems.map((system) => ({
     systemName: system.systemName,
@@ -428,6 +550,7 @@ export const generateSpanshExobiologyRoute = async (
   return {
     routeName: `Exobiology ${routeLabel}`,
     legs,
-    previewRows
+    previewRows,
+    exobiologySystems
   };
 };
