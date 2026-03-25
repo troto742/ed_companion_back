@@ -78,7 +78,7 @@ const spanshExobiologyRouteSchema = z.object({
       y: z.number(),
       z: z.number()
     }).optional(),
-    size: z.coerce.number().int().min(1).max(500).default(10),
+    size: z.coerce.number().int().min(1).max(30).default(30),
     sort: z.array(z.record(z.unknown())).min(1).default([{ distance: { direction: "asc" } }])
   }),
   searchReference: z.string().trim().optional()

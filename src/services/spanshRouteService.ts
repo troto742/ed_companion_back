@@ -7,6 +7,8 @@ const DEFAULT_EXACT_ROUTE_TIMEOUT_MS = 5 * 60_000;
 const INITIAL_POLL_INTERVAL_MS = 1_000;
 const MAX_POLL_INTERVAL_MS = 5_000;
 const MAX_BODY_SEARCH_PAGE_SIZE = 500;
+const MAX_EXOBIOLOGY_SYSTEM_RESULTS = 30;
+const MAX_EXOBIOLOGY_SCAN_PAGES = 10;
 
 export interface SpanshRouteRequest {
   sourceSystem: string;
@@ -374,10 +376,15 @@ export const generateSpanshExobiologyRoute = async (
     throw new Error("Spansh exobiology search payload is required.");
   }
 
-  // Keep the user filters, but force larger page size for efficient bulk import.
-  const pageSize = MAX_BODY_SEARCH_PAGE_SIZE;
+  const requestedSize = toFiniteNumberOrNull(request.search.size);
+  const requestedPage = toFiniteNumberOrNull(request.search.page);
+  const targetSystems = Math.min(
+    MAX_EXOBIOLOGY_SYSTEM_RESULTS,
+    Math.max(1, Math.trunc(requestedSize ?? MAX_EXOBIOLOGY_SYSTEM_RESULTS))
+  );
+  const startPage = Math.max(0, Math.trunc(requestedPage ?? 0));
 
-  const firstPage = await fetchBodySearchPage(request.search, 0, pageSize);
+  const firstPage = await fetchBodySearchPage(request.search, startPage, targetSystems);
   const totalRows = Math.max(0, firstPage.count);
   if (totalRows === 0 && firstPage.results.length === 0) {
     throw new Error("Spansh exobiology search returned no results.");
@@ -448,12 +455,18 @@ export const generateSpanshExobiologyRoute = async (
     }
   };
 
-  const totalPages = Math.max(1, Math.ceil(Math.max(totalRows, firstPage.results.length) / pageSize));
-  for (let page = 0; page < totalPages; page += 1) {
-    const pagePayload = page === 0
+  const totalPages = Math.max(1, Math.ceil(Math.max(totalRows, firstPage.results.length) / targetSystems));
+  let scannedPages = 0;
+  for (let page = startPage; page < totalPages; page += 1) {
+    if (scannedPages >= MAX_EXOBIOLOGY_SCAN_PAGES || systemsByName.size >= targetSystems) {
+      break;
+    }
+
+    const pagePayload = page === startPage
       ? firstPage
-      : await fetchBodySearchPage(request.search, page, pageSize);
+      : await fetchBodySearchPage(request.search, page, targetSystems);
     tryAppendPage(pagePayload.results);
+    scannedPages += 1;
   }
 
   const exobiologySystems: SpanshExobiologySystemCandidate[] = Array.from(systemsByName.values()).map((system) => {
@@ -509,7 +522,7 @@ export const generateSpanshExobiologyRoute = async (
     }
 
     return left.systemName.localeCompare(right.systemName);
-  });
+  }).slice(0, targetSystems);
 
   if (exobiologySystems.length === 0) {
     throw new Error("Spansh exobiology search did not contain valid system rows.");
