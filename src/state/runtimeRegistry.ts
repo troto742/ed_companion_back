@@ -8,6 +8,7 @@ export interface TenantRuntime {
   tenantLabel: string;
   keyFingerprint: string;
   commanderName: string;
+  lastSeenAt: string;
   store: StateStore;
 }
 
@@ -92,6 +93,7 @@ export class RuntimeRegistry {
         runtime.keyFingerprint = identity.keyFingerprint;
       }
 
+      runtime.lastSeenAt = new Date().toISOString();
       return runtime;
     }
 
@@ -112,6 +114,7 @@ export class RuntimeRegistry {
       tenantLabel: identity.tenantLabel,
       keyFingerprint: identity.keyFingerprint,
       commanderName: identity.commanderName,
+      lastSeenAt: new Date().toISOString(),
       store: new StateStore()
     };
 
@@ -127,5 +130,10 @@ export class RuntimeRegistry {
     );
 
     return runtime;
+  }
+
+  async listRuntimes(): Promise<TenantRuntime[]> {
+    const runtimes = await Promise.all([...this.runtimes.values()]);
+    return runtimes;
   }
 }
