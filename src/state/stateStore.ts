@@ -575,8 +575,10 @@ export class StateStore {
 
     const normalized = sourceText.replace(/\s+/g, " ").trim();
     const patterns = [
-      /(?:source and return|mine|deliver|acquire)\s+(\d+)\s+units?\s+of\s+(.+)$/i,
-      /(?:source and return|mine|deliver|acquire)\s+(\d+)\s+(.+)$/i
+      /(?:source and return|mine|deliver|acquire)\s+([\d,.\s]+)\s+units?\s+of\s+(.+)$/i,
+      /(?:source and return|mine|deliver|acquire)\s+([\d,.\s]+)\s+(.+)$/i,
+      /(?:localiza y trae|localizar y traer|entrega|entregar|compra|comprar|mina|minar)\s+([\d,.\s]+)\s+unidades?\s+de\s+(.+)$/i,
+      /(?:localiza y trae|localizar y traer|entrega|entregar|compra|comprar|mina|minar)\s+([\d,.\s]+)\s+(.+)$/i
     ];
 
     for (const pattern of patterns) {
@@ -585,8 +587,8 @@ export class StateStore {
         continue;
       }
 
-      const count = Number(match[1]);
-      const commodity = match[2]?.trim() ?? "";
+      const count = Number((match[1] ?? "").replace(/[.,\s]/g, ""));
+      const commodity = (match[2]?.trim() ?? "").replace(/[.!?]+$/g, "").trim();
       if (!Number.isFinite(count) || !commodity) {
         continue;
       }
