@@ -32,6 +32,13 @@ export interface SpanshExobiologyBodyCandidate {
   distanceToArrivalLs: number | null;
   subtype: string | null;
   atmosphere: string | null;
+  biologicalSignals: number;
+  samples: SpanshExobiologySampleCandidate[];
+}
+
+export interface SpanshExobiologySampleCandidate {
+  name: string;
+  value: number;
 }
 
 export interface SpanshExobiologySystemCandidate {
@@ -114,6 +121,10 @@ export interface SpanshExobiologyRouteRequest {
     z?: number;
   };
   searchReference?: string;
+  criteria?: {
+    minBiologicalSignals?: number;
+    minSampleValue?: number;
+  };
 }
 
 interface SpanshBodySearchReference {
@@ -127,6 +138,8 @@ interface SpanshBodySearchResult {
   distance_to_arrival?: number;
   subtype?: string;
   atmosphere?: string;
+  signals?: Array<{ name?: string; count?: number }>;
+  landmarks?: Array<{ subtype?: string; type?: string; value?: number }>;
 }
 
 interface SpanshBodySearchPagePayload {
@@ -383,6 +396,8 @@ export const generateSpanshExobiologyRoute = async (
     Math.max(1, Math.trunc(requestedSize ?? MAX_EXOBIOLOGY_SYSTEM_RESULTS))
   );
   const startPage = Math.max(0, Math.trunc(requestedPage ?? 0));
+  const minBiologicalSignals = Math.max(1, Math.trunc(request.criteria?.minBiologicalSignals ?? 3));
+  const minSampleValue = Math.max(0, request.criteria?.minSampleValue ?? 10_000_000);
 
   const firstPage = await fetchBodySearchPage(request.search, startPage, targetSystems);
   const totalRows = Math.max(0, firstPage.count);
@@ -411,6 +426,36 @@ export const generateSpanshExobiologyRoute = async (
       const bodyName = typeof row.name === "string" ? row.name.trim() : "";
       const bodySubtype = typeof row.subtype === "string" ? row.subtype.trim() : "";
       const bodyAtmosphere = typeof row.atmosphere === "string" ? row.atmosphere.trim() : "";
+      const biologicalSignals = Array.isArray(row.signals)
+        ? row.signals.reduce((total, signal) =>
+          typeof signal.name === "string" && signal.name.toLowerCase() === "biological"
+            ? total + Math.max(0, Math.trunc(toFiniteNumberOrNull(signal.count) ?? 0))
+            : total, 0)
+        : 0;
+      const samplesByName = new Map<string, SpanshExobiologySampleCandidate>();
+      for (const landmark of Array.isArray(row.landmarks) ? row.landmarks : []) {
+        const name = (typeof landmark.subtype === "string" ? landmark.subtype : landmark.type)?.trim() ?? "";
+        const value = toFiniteNumberOrNull(landmark.value);
+        if (!name || value === null) {
+          continue;
+        }
+        const key = name.toLowerCase();
+        const existing = samplesByName.get(key);
+        if (!existing || value > existing.value) {
+          samplesByName.set(key, { name, value });
+        }
+      }
+      const samples = Array.from(samplesByName.values()).sort((left, right) => right.value - left.value);
+
+      // A planet is only accepted when every identified biological sample meets the
+      // requested value. Unknown sample values are deliberately not treated as profitable.
+      if (
+        biologicalSignals < minBiologicalSignals
+        || samples.length === 0
+        || samples.some((sample) => sample.value < minSampleValue)
+      ) {
+        continue;
+      }
 
       const existingSystem = systemsByName.get(normalizedSystem);
       const systemCandidate: MutableSystemCandidate = existingSystem ?? {
@@ -436,7 +481,9 @@ export const generateSpanshExobiologyRoute = async (
             bodyName,
             distanceToArrivalLs,
             subtype: bodySubtype || null,
-            atmosphere: bodyAtmosphere || null
+            atmosphere: bodyAtmosphere || null,
+            biologicalSignals,
+            samples
           });
         } else {
           if (distanceToArrivalLs !== null && (existingBody.distanceToArrivalLs === null || distanceToArrivalLs < existingBody.distanceToArrivalLs)) {
@@ -448,6 +495,8 @@ export const generateSpanshExobiologyRoute = async (
           if (!existingBody.atmosphere && bodyAtmosphere) {
             existingBody.atmosphere = bodyAtmosphere;
           }
+          existingBody.biologicalSignals = Math.max(existingBody.biologicalSignals, biologicalSignals);
+          existingBody.samples = samples;
         }
       }
 

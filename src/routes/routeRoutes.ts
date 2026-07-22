@@ -49,26 +49,7 @@ const spanshExobiologyRouteSchema = z.object({
     z: z.number().optional()
   }).optional(),
   search: z.object({
-    filters: z.object({
-      atmosphere: z.object({
-        value: z.array(z.string().trim().min(1)).min(1)
-      }),
-      distance: z.object({
-        min: z.union([z.string(), z.number()]),
-        max: z.union([z.string(), z.number()])
-      }),
-      gravity: z.object({
-        comparison: z.string().trim().default("<=>"),
-        value: z.tuple([z.union([z.string(), z.number()]), z.union([z.string(), z.number()])])
-      }),
-      subtype: z.object({
-        value: z.array(z.string().trim().min(1)).min(1)
-      }),
-      updated_at: z.object({
-        comparison: z.string().trim().default("<=>"),
-        value: z.tuple([z.string().trim().min(1), z.string().trim().min(1)])
-      })
-    }),
+    filters: z.record(z.unknown()).default({}),
     page: z.coerce.number().int().min(0).default(0),
     reference_system: z.string().trim().min(1, "Reference system is required."),
     reference_system_details: z.object({
@@ -81,14 +62,20 @@ const spanshExobiologyRouteSchema = z.object({
     size: z.coerce.number().int().min(1).max(30).default(30),
     sort: z.array(z.record(z.unknown())).min(1).default([{ distance: { direction: "asc" } }])
   }),
-  searchReference: z.string().trim().optional()
+  searchReference: z.string().trim().optional(),
+  criteria: z.object({
+    minBiologicalSignals: z.coerce.number().int().min(1).max(20).default(3),
+    minSampleValue: z.coerce.number().min(0).default(10_000_000)
+  }).optional()
 }).superRefine((value, ctx) => {
-  const distanceMin = Number(value.search.filters.distance.min);
-  const distanceMax = Number(value.search.filters.distance.max);
-  const gravityMin = Number(value.search.filters.gravity.value[0]);
-  const gravityMax = Number(value.search.filters.gravity.value[1]);
+  const distanceFilter = value.search.filters["distance"] as { min?: unknown; max?: unknown } | undefined;
+  const gravityFilter = value.search.filters["gravity"] as { value?: unknown[] } | undefined;
+  const distanceMin = Number(distanceFilter?.min);
+  const distanceMax = Number(distanceFilter?.max);
+  const gravityMin = Number(gravityFilter?.value?.[0]);
+  const gravityMax = Number(gravityFilter?.value?.[1]);
 
-  if (Number.isFinite(distanceMin) && Number.isFinite(distanceMax) && distanceMin > distanceMax) {
+  if (distanceFilter && Number.isFinite(distanceMin) && Number.isFinite(distanceMax) && distanceMin > distanceMax) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: "Distance min cannot be greater than distance max.",
@@ -96,7 +83,7 @@ const spanshExobiologyRouteSchema = z.object({
     });
   }
 
-  if (Number.isFinite(gravityMin) && Number.isFinite(gravityMax) && gravityMin > gravityMax) {
+  if (gravityFilter && Number.isFinite(gravityMin) && Number.isFinite(gravityMax) && gravityMin > gravityMax) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       message: "Gravity min cannot be greater than gravity max.",
