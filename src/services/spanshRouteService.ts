@@ -167,22 +167,45 @@ const fetchBodySearchPage = async (
   page: number,
   size: number
 ): Promise<Required<Pick<SpanshBodySearchPagePayload, "count" | "from" | "size" | "results">>> => {
-  const body = {
+  const body: Record<string, unknown> = {
     ...search,
     page: Math.max(0, Math.trunc(page)),
     size: Math.min(MAX_BODY_SEARCH_PAGE_SIZE, Math.max(1, Math.trunc(size)))
   };
 
-  const response = await fetch(`${SPANSH_BASE_URL}/api/bodies/search`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json"
-    },
-    body: JSON.stringify(body)
-  });
+  const executeSearch = (payload: Record<string, unknown>): Promise<Response> =>
+    fetch(`${SPANSH_BASE_URL}/api/bodies/search`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+
+  let response = await executeSearch(body);
+
+  // Spansh has changed support for these aggregate filters between API versions.
+  // They are only an optimization: the strict biological/value check is always
+  // performed below, so retrying without them does not weaken the result.
+  if (response.status === 400 && isRecord(body.filters)) {
+    const fallbackFilters = { ...body.filters };
+    const hadOptimizedFilters = "signal_count" in fallbackFilters || "landmark_value" in fallbackFilters;
+    delete fallbackFilters["signal_count"];
+    delete fallbackFilters["landmark_value"];
+
+    if (hadOptimizedFilters) {
+      response = await executeSearch({
+        ...body,
+        filters: fallbackFilters
+      });
+    }
+  }
 
   if (!response.ok) {
-    throw new Error(`Spansh exobiology bulk search failed with HTTP ${response.status}.`);
+    const details = (await response.text()).trim().slice(0, 500);
+    throw new Error(
+      `Spansh exobiology bulk search failed with HTTP ${response.status}${details ? `: ${details}` : "."}`
+    );
   }
 
   const payload = await response.json() as SpanshBodySearchPagePayload;
