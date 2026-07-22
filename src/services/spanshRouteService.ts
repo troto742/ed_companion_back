@@ -194,9 +194,14 @@ const fetchBodySearchPage = async (
     delete fallbackFilters["landmark_value"];
 
     if (hadOptimizedFilters) {
+      // An empty filters object is itself invalid in Spansh. Keep any caller-supplied
+      // native filters, or use a galaxy-wide distance constraint as a neutral fallback.
+      const safeFallbackFilters = Object.keys(fallbackFilters).length > 0
+        ? fallbackFilters
+        : { distance: { min: "0", max: "40000" } };
       response = await executeSearch({
         ...body,
-        filters: fallbackFilters
+        filters: safeFallbackFilters
       });
     }
   }
