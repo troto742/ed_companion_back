@@ -74,6 +74,8 @@ export class StateStore {
 
   private location: StateSnapshot["location"] = {
     starSystem: null,
+    systemAddress: null,
+    starPos: null,
     bodyName: null,
     stationName: null,
     fleetCarrier: null,
@@ -372,8 +374,11 @@ export class StateStore {
         });
 
         const starSystem = String(data.StarSystem ?? "").trim();
+        const starPos = this.readStarPos(data.StarPos);
         locationPatchApplied = updateLocationFromPatch({
           starSystem: starSystem || this.location.starSystem,
+          systemAddress: this.readNumber(data, ["SystemAddress"], this.location.systemAddress),
+          starPos: starPos ?? this.location.starPos,
           bodyName: null,
           stationName: null,
           fleetCarrier: null,
@@ -388,8 +393,11 @@ export class StateStore {
       }
       case "location": {
         const starSystem = String(data.StarSystem ?? "").trim();
+        const starPos = this.readStarPos(data.StarPos);
         locationPatchApplied = updateLocationFromPatch({
           starSystem: starSystem || this.location.starSystem,
+          systemAddress: this.readNumber(data, ["SystemAddress"], this.location.systemAddress),
+          starPos: starPos ?? this.location.starPos,
           bodyName: this.readString(data, ["Body", "BodyName"], this.location.bodyName),
           stationName: this.readString(data, ["StationName"], this.location.stationName),
           fleetCarrier: this.readString(data, ["StationType"], this.location.fleetCarrier),
@@ -1068,6 +1076,17 @@ export class StateStore {
     this.missions.active = next;
     this.missions.updatedAt = timestamp;
     return true;
+  }
+
+  private readStarPos(value: unknown): { x: number; y: number; z: number } | null {
+    if (!Array.isArray(value) || value.length < 3) {
+      return null;
+    }
+
+    const [x, y, z] = value.map(Number);
+    return Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)
+      ? { x, y, z }
+      : null;
   }
 
   private syncRoute(starSystem: string, timestamp: string): boolean {

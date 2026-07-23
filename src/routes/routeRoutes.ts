@@ -51,7 +51,12 @@ const spanshExobiologyRouteSchema = z.object({
   search: z.object({
     filters: z.record(z.unknown()).default({}),
     page: z.coerce.number().int().min(0).default(0),
-    reference_system: z.string().trim().min(1, "Reference system is required."),
+    reference_system: z.string().trim().min(1).optional(),
+    reference_coords: z.object({
+      x: z.number(),
+      y: z.number(),
+      z: z.number()
+    }).optional(),
     reference_system_details: z.object({
       id64: z.union([z.number(), z.string()]).optional(),
       name: z.string().trim().min(1),
@@ -68,6 +73,14 @@ const spanshExobiologyRouteSchema = z.object({
     minSampleValue: z.coerce.number().min(0).default(10_000_000)
   }).optional()
 }).superRefine((value, ctx) => {
+  if (!value.search.reference_system && !value.search.reference_coords) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Reference system or coordinates are required.",
+      path: ["search"]
+    });
+  }
+
   const distanceFilter = value.search.filters["distance"] as { min?: unknown; max?: unknown } | undefined;
   const gravityFilter = value.search.filters["gravity"] as { value?: unknown[] } | undefined;
   const distanceMin = Number(distanceFilter?.min);
