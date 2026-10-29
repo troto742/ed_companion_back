@@ -43,6 +43,18 @@ flowchart LR
 
 `StateStore` procesa los eventos y descarta duplicados o eventos fuera de orden. `RuntimeRegistry` mantiene el estado de cada tenant, es decir, el entorno aislado de cada API key. Si una operación de persistencia falla, los endpoints de ingestión restauran el estado previo antes de propagar el error.
 
+### Integración con SrvSurvey
+
+**SrvSurvey** es una aplicación de escritorio de terceros para Elite Dangerous, desarrollada en .NET, que lee los archivos Journal y Status del juego y muestra overlays de ayuda para exploración, escaneos biológicos y navegación por superficie. En este workspace se ha adaptado para actuar también como cliente de telemetría del companion.
+
+Para conectar ambos proyectos se implementó un contrato HTTP de ingestión que no formaba parte de la integración original. **SrvSurvey consume los endpoints del backend** y le envía los datos del juego; el backend los procesa y actualiza el dashboard mediante Socket.IO. Los cambios que permiten este flujo son:
+
+- **Cliente HTTP en SrvSurvey:** `srvSurvey/SrvSurvey/net/EliteDangerousCompanion.cs` convierte los eventos del juego al formato `{ timestamp, eventType, data }`, adapta Status (combustible, carga, casco, escudos y ubicación) y envía JSON autenticado con `x-api-key`. También permite enviar lotes de eventos y registra errores HTTP sin interrumpir el procesamiento local del juego.
+- **Conexión con el ciclo del juego:** `srvSurvey/SrvSurvey/game/Game.cs` inicializa el cliente, envía los nuevos eventos Journal y los cambios de Status, y reenvía información inicial de partida, nave y misiones para poblar el dashboard al arrancar.
+- **Endpoints receptores en el backend:** [src/routes/ingestRoutes.ts](src/routes/ingestRoutes.ts) implementa `POST /api/ingest/journal`, `POST /api/ingest/status` y `POST /api/ingest/journal/batch`. Se registran en [src/index.ts](src/index.ts) con autenticación y límite de peticiones; validan los datos con Zod y los aplican al estado de la API key correspondiente, con persistencia opcional y emisión de cambios en tiempo real.
+
+La URL y la clave se configuran en SrvSurvey mediante `eliteCompanionBackendUrl` y `eliteCompanionApiKey` de `Settings.cs`, o mediante las variables `ELITE_COMPANION_BACKEND_URL` y `ELITE_COMPANION_API_KEY` como alternativa. Para desarrollo local, usa `http://localhost:3000` y una clave aceptada por el backend. Sin URL explícita, el cliente utiliza `https://ecm.troto.es`; sin clave, no envía telemetría. Esta integración requiere la versión modificada de SrvSurvey incluida en el workspace.
+
 ## Arranque local
 
 Necesitas **Node.js 22 y npm 10 o superior**. PostgreSQL es opcional. Ejecuta los comandos desde la raíz de este repositorio, la carpeta `backend` si usas el workspace completo.
