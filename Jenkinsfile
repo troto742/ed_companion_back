@@ -1,13 +1,14 @@
 pipeline {
   agent any
 
+  // Configura el destino y crea las credenciales referenciadas en Jenkins.
   environment {
     REGISTRY_URL        = 'docker.io'
     FULL_IMAGE          = 'troto742/ed_companion-back:latest'
     REGISTRY_CREDENTIAL = 'docker-registry-creds'
     DEPLOY_CREDENTIAL   = 'deploy-server-ssh'
-    DEPLOY_HOST         = 'root@vmi2418300'
-    DEPLOY_PATH         = '/root/docker-compose-ED_companion'
+    DEPLOY_HOST         = 'REEMPLAZAR_USUARIO@REEMPLAZAR_HOST'
+    DEPLOY_PATH         = '/REEMPLAZAR_RUTA_DEL_DESPLIEGUE'
     SERVICE_NAME        = 'backend'
   }
 

@@ -1,3 +1,8 @@
 node_modules
 dist
 .env
+
+# Configuracion local y secretos; solo se versionan plantillas.
+.env
+.env.*
+!.env.example
