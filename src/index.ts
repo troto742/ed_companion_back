@@ -17,11 +17,13 @@ import {
 } from "./middleware/apiKey";
 import { errorHandler } from "./middleware/errorHandler";
 import { createAdminKeyRoutes } from "./routes/adminKeyRoutes";
+import { createFriendRoutes } from "./routes/friendRoutes";
 import { createIngestRoutes } from "./routes/ingestRoutes";
 import { createRouteRoutes } from "./routes/routeRoutes";
 import { createStateRoutes } from "./routes/stateRoutes";
 import { createTradeRoutes } from "./routes/tradeRoutes";
 import { createApiKeyStore, ApiKeyStore } from "./services/apiKeyStore";
+import { FriendStore } from "./services/friendStore";
 import { RuntimeRegistry, TenantRuntime } from "./state/runtimeRegistry";
 import { StateChangeSet } from "./types/state";
 
@@ -120,6 +122,7 @@ const bootstrap = async (): Promise<void> => {
     tenantMode: settings.tenantMode,
     resolveTenantLabel: (apiKey) => settings.apiKeyLabels[apiKey] ?? null
   });
+  const friendStore = new FriendStore();
 
   const ingestLimiter = rateLimit({
     windowMs: settings.ingestRateLimitWindowMs,
@@ -196,6 +199,13 @@ const bootstrap = async (): Promise<void> => {
   app.use("/api/trade", requireApiKey, createTradeRoutes({
     resolveRuntime: (apiKey, tenantLabel, keyFingerprint) =>
       runtimeRegistry.getRuntime(apiKey, tenantLabel, keyFingerprint)
+  }));
+
+  app.use("/api/friends", requireApiKey, createFriendRoutes({
+    resolveRuntime: (apiKey, tenantLabel, keyFingerprint) =>
+      runtimeRegistry.getRuntime(apiKey, tenantLabel, keyFingerprint),
+    runtimeRegistry,
+    friendStore
   }));
 
   app.use("/api", requireApiKey, createStateRoutes({

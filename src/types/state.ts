@@ -32,6 +32,8 @@ export interface ShipState {
 
 export interface LocationState {
   starSystem: string | null;
+  systemAddress: number | null;
+  starPos: { x: number; y: number; z: number } | null;
   bodyName: string | null;
   stationName: string | null;
   fleetCarrier: string | null;

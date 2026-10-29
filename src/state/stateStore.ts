@@ -44,6 +44,7 @@ const normalizeText = (value: string | undefined): string | null => {
 export interface StoreCheckpoint {
   snapshot: StateSnapshot;
   seenEventQueue: string[];
+  shipJournalUpdatedAt: string | null;
 }
 
 export class StateStore {
@@ -73,6 +74,8 @@ export class StateStore {
 
   private location: StateSnapshot["location"] = {
     starSystem: null,
+    systemAddress: null,
+    starPos: null,
     bodyName: null,
     stationName: null,
     fleetCarrier: null,
@@ -111,6 +114,10 @@ export class StateStore {
 
   private seenEventKeys: Set<string> = new Set();
   private seenEventQueue: string[] = [];
+  // Status.json and Journal events are independent streams. A Status update must
+  // not make a slightly older Loadout event look stale, because Status does not
+  // carry the ship identity.
+  private shipJournalUpdatedAt: string | null = null;
 
   getSnapshot(): StateSnapshot {
     return {
@@ -142,12 +149,14 @@ export class StateStore {
     this.applySnapshot(snapshot);
     this.seenEventKeys.clear();
     this.seenEventQueue = [];
+    this.shipJournalUpdatedAt = null;
   }
 
   createCheckpoint(): StoreCheckpoint {
     return {
       snapshot: this.getSnapshot(),
-      seenEventQueue: [...this.seenEventQueue]
+      seenEventQueue: [...this.seenEventQueue],
+      shipJournalUpdatedAt: this.shipJournalUpdatedAt
     };
   }
 
@@ -155,6 +164,7 @@ export class StateStore {
     this.applySnapshot(checkpoint.snapshot);
     this.seenEventQueue = [...checkpoint.seenEventQueue];
     this.seenEventKeys = new Set(checkpoint.seenEventQueue);
+    this.shipJournalUpdatedAt = checkpoint.shipJournalUpdatedAt;
   }
 
   applyStatus(payload: StatusPayload): StateChangeSet {
@@ -261,7 +271,12 @@ export class StateStore {
     const eventType = payload.eventType;
     const event = eventType.trim().toLowerCase();
     const isMissionEvent = event === "missions" || event.startsWith("mission");
-    const lastRelevantTimestamp = isMissionEvent ? this.missions.updatedAt : this.location.updatedAt;
+    const isShipIdentityEvent = event === "loadgame" || event === "loadout";
+    const lastRelevantTimestamp = isMissionEvent
+      ? this.missions.updatedAt
+      : isShipIdentityEvent
+        ? this.shipJournalUpdatedAt
+        : this.location.updatedAt;
     if (isOutOfOrder(timestamp, lastRelevantTimestamp)) {
       return {
         shipUpdated: false,
@@ -312,7 +327,8 @@ export class StateStore {
     };
 
     const updateShipFromPatch = (patch: Partial<StateSnapshot["ship"]>): boolean => {
-      const nextShip = { ...this.ship, ...patch, updatedAt: timestamp };
+      const updatedAt = isOutOfOrder(timestamp, this.ship.updatedAt) ? this.ship.updatedAt : timestamp;
+      const nextShip = { ...this.ship, ...patch, updatedAt };
       const changed = JSON.stringify(nextShip) !== JSON.stringify(this.ship);
       if (changed) {
         this.ship = nextShip;
@@ -358,8 +374,11 @@ export class StateStore {
         });
 
         const starSystem = String(data.StarSystem ?? "").trim();
+        const starPos = this.readStarPos(data.StarPos);
         locationPatchApplied = updateLocationFromPatch({
           starSystem: starSystem || this.location.starSystem,
+          systemAddress: this.readNumber(data, ["SystemAddress"], this.location.systemAddress),
+          starPos: starPos ?? this.location.starPos,
           bodyName: null,
           stationName: null,
           fleetCarrier: null,
@@ -374,8 +393,11 @@ export class StateStore {
       }
       case "location": {
         const starSystem = String(data.StarSystem ?? "").trim();
+        const starPos = this.readStarPos(data.StarPos);
         locationPatchApplied = updateLocationFromPatch({
           starSystem: starSystem || this.location.starSystem,
+          systemAddress: this.readNumber(data, ["SystemAddress"], this.location.systemAddress),
+          starPos: starPos ?? this.location.starPos,
           bodyName: this.readString(data, ["Body", "BodyName"], this.location.bodyName),
           stationName: this.readString(data, ["StationName"], this.location.stationName),
           fleetCarrier: this.readString(data, ["StationType"], this.location.fleetCarrier),
@@ -455,6 +477,10 @@ export class StateStore {
           routeUpdated = this.syncRoute(starSystem, timestamp);
         }
       }
+    }
+
+    if (isShipIdentityEvent) {
+      this.shipJournalUpdatedAt = timestamp;
     }
 
     return {
@@ -575,8 +601,10 @@ export class StateStore {
 
     const normalized = sourceText.replace(/\s+/g, " ").trim();
     const patterns = [
-      /(?:source and return|mine|deliver|acquire)\s+(\d+)\s+units?\s+of\s+(.+)$/i,
-      /(?:source and return|mine|deliver|acquire)\s+(\d+)\s+(.+)$/i
+      /(?:source and return|mine|deliver|acquire)\s+([\d,.\s]+)\s+units?\s+of\s+(.+)$/i,
+      /(?:source and return|mine|deliver|acquire)\s+([\d,.\s]+)\s+(.+)$/i,
+      /(?:localiza y trae|localizar y traer|entrega|entregar|compra|comprar|mina|minar)\s+([\d,.\s]+)\s+unidades?\s+de\s+(.+)$/i,
+      /(?:localiza y trae|localizar y traer|entrega|entregar|compra|comprar|mina|minar)\s+([\d,.\s]+)\s+(.+)$/i
     ];
 
     for (const pattern of patterns) {
@@ -585,8 +613,8 @@ export class StateStore {
         continue;
       }
 
-      const count = Number(match[1]);
-      const commodity = match[2]?.trim() ?? "";
+      const count = Number((match[1] ?? "").replace(/[.,\s]/g, ""));
+      const commodity = (match[2]?.trim() ?? "").replace(/[.!?]+$/g, "").trim();
       if (!Number.isFinite(count) || !commodity) {
         continue;
       }
@@ -1048,6 +1076,17 @@ export class StateStore {
     this.missions.active = next;
     this.missions.updatedAt = timestamp;
     return true;
+  }
+
+  private readStarPos(value: unknown): { x: number; y: number; z: number } | null {
+    if (!Array.isArray(value) || value.length < 3) {
+      return null;
+    }
+
+    const [x, y, z] = value.map(Number);
+    return Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)
+      ? { x, y, z }
+      : null;
   }
 
   private syncRoute(starSystem: string, timestamp: string): boolean {

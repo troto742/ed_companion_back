@@ -5,7 +5,7 @@ import { z } from "zod";
 import { PersistenceStore } from "../db/postgresPersistence";
 import { getApiAuthFromRequest, getApiKeyFromRequest } from "../middleware/apiKey";
 import { parseRouteFile } from "../services/routeParser";
-import { generateSpanshExactRoute, generateSpanshRoute } from "../services/spanshRouteService";
+import { generateSpanshExactRoute, generateSpanshExobiologyRoute, generateSpanshRoute } from "../services/spanshRouteService";
 import { TenantRuntime } from "../state/runtimeRegistry";
 import { RouteLeg, StateChangeSet } from "../types/state";
 
@@ -38,6 +38,71 @@ const spanshExactRouteSchema = z.object({
   refuelEveryScoopable: z.coerce.boolean().default(true),
   isSupercharged: z.coerce.boolean().default(false),
   algorithm: z.enum(["optimistic", "guided", "fuel", "fuel_jumps", "pessimistic"]).default("optimistic")
+});
+
+const spanshExobiologyRouteSchema = z.object({
+  reference: z.object({
+    id64: z.union([z.number(), z.string()]).optional(),
+    name: z.string().trim().optional(),
+    x: z.number().optional(),
+    y: z.number().optional(),
+    z: z.number().optional()
+  }).optional(),
+  search: z.object({
+    filters: z.record(z.unknown()).default({}),
+    page: z.coerce.number().int().min(0).default(0),
+    reference_system: z.string().trim().min(1).optional(),
+    reference_coords: z.object({
+      x: z.number(),
+      y: z.number(),
+      z: z.number()
+    }).optional(),
+    reference_system_details: z.object({
+      id64: z.union([z.number(), z.string()]).optional(),
+      name: z.string().trim().min(1),
+      x: z.number(),
+      y: z.number(),
+      z: z.number()
+    }).optional(),
+    size: z.coerce.number().int().min(1).max(30).default(30),
+    sort: z.array(z.record(z.unknown())).min(1).default([{ distance: { direction: "asc" } }])
+  }),
+  searchReference: z.string().trim().optional(),
+  criteria: z.object({
+    minBiologicalSignals: z.coerce.number().int().min(1).max(20).default(3),
+    minSampleValue: z.coerce.number().min(0).default(10_000_000)
+  }).optional()
+}).superRefine((value, ctx) => {
+  if (!value.search.reference_system && !value.search.reference_coords) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Reference system or coordinates are required.",
+      path: ["search"]
+    });
+  }
+
+  const distanceFilter = value.search.filters["distance"] as { min?: unknown; max?: unknown } | undefined;
+  const gravityFilter = value.search.filters["gravity"] as { value?: unknown[] } | undefined;
+  const distanceMin = Number(distanceFilter?.min);
+  const distanceMax = Number(distanceFilter?.max);
+  const gravityMin = Number(gravityFilter?.value?.[0]);
+  const gravityMax = Number(gravityFilter?.value?.[1]);
+
+  if (distanceFilter && Number.isFinite(distanceMin) && Number.isFinite(distanceMax) && distanceMin > distanceMax) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Distance min cannot be greater than distance max.",
+      path: ["search", "filters", "distance"]
+    });
+  }
+
+  if (gravityFilter && Number.isFinite(gravityMin) && Number.isFinite(gravityMax) && gravityMin > gravityMax) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: "Gravity min cannot be greater than gravity max.",
+      path: ["search", "filters", "gravity"]
+    });
+  }
 });
 
 export const createRouteRoutes = (dependencies: RouteRouteDependencies): Router => {
@@ -169,6 +234,49 @@ export const createRouteRoutes = (dependencies: RouteRouteDependencies): Router 
           routeName: generatedRoute.routeName,
           legs: generatedRoute.legs.length,
           previewRows: generatedRoute.previewRows
+        });
+      } catch (error) {
+        runtime.store.restoreCheckpoint(checkpoint);
+        throw error;
+      }
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.post("/spansh/exobiology", async (request, response, next) => {
+    const parsedRequest = spanshExobiologyRouteSchema.safeParse(request.body);
+    if (!parsedRequest.success) {
+      response.status(400).json({ error: parsedRequest.error.issues[0]?.message ?? "Invalid Spansh exobiology request." });
+      return;
+    }
+
+    try {
+      const authContext = getApiAuthFromRequest(request);
+      const apiKey = authContext?.apiKey ?? getApiKeyFromRequest(request);
+      const runtime = await resolveRuntime(apiKey, authContext?.tenantLabel, authContext?.keyFingerprint);
+      const checkpoint = runtime.store.createCheckpoint();
+
+      try {
+        const generatedRoute = await generateSpanshExobiologyRoute(parsedRequest.data);
+        const changes = runtime.store.loadRoute(generatedRoute.routeName, generatedRoute.legs, new Date().toISOString());
+
+        if (persistence) {
+          await persistence.persistRoute(
+            runtime.commanderName,
+            generatedRoute.routeName,
+            generatedRoute.legs,
+            runtime.store.getSnapshot()
+          );
+        }
+
+        onStateChanged(runtime, changes);
+        response.status(201).json({
+          routeLoaded: true,
+          routeName: generatedRoute.routeName,
+          legs: generatedRoute.legs.length,
+          previewRows: generatedRoute.previewRows,
+          exobiologySystems: generatedRoute.exobiologySystems ?? []
         });
       } catch (error) {
         runtime.store.restoreCheckpoint(checkpoint);

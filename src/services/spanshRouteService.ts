@@ -6,6 +6,9 @@ const DEFAULT_ROUTE_TIMEOUT_MS = 45_000;
 const DEFAULT_EXACT_ROUTE_TIMEOUT_MS = 5 * 60_000;
 const INITIAL_POLL_INTERVAL_MS = 1_000;
 const MAX_POLL_INTERVAL_MS = 5_000;
+const MAX_BODY_SEARCH_PAGE_SIZE = 500;
+const MAX_EXOBIOLOGY_SYSTEM_RESULTS = 30;
+const MAX_EXOBIOLOGY_SCAN_PAGES = 10;
 
 export interface SpanshRouteRequest {
   sourceSystem: string;
@@ -22,6 +25,27 @@ export interface SpanshRoutePreviewRow {
   estimatedJumps: number | null;
   refuel: boolean;
   neutronStar: boolean;
+}
+
+export interface SpanshExobiologyBodyCandidate {
+  bodyName: string;
+  distanceToArrivalLs: number | null;
+  subtype: string | null;
+  atmosphere: string | null;
+  biologicalSignals: number;
+  samples: SpanshExobiologySampleCandidate[];
+}
+
+export interface SpanshExobiologySampleCandidate {
+  name: string;
+  value: number;
+}
+
+export interface SpanshExobiologySystemCandidate {
+  systemName: string;
+  distanceLy: number | null;
+  nearestBodyLs: number | null;
+  bodies: SpanshExobiologyBodyCandidate[];
 }
 
 interface SpanshJobResponse {
@@ -70,6 +94,7 @@ export interface SpanshRouteResult {
   routeName: string;
   legs: RouteLeg[];
   previewRows: SpanshRoutePreviewRow[];
+  exobiologySystems?: SpanshExobiologySystemCandidate[];
 }
 
 export interface SpanshExactRouteRequest {
@@ -86,10 +111,118 @@ export interface SpanshExactRouteRequest {
   algorithm: "optimistic" | "guided" | "fuel" | "fuel_jumps" | "pessimistic";
 }
 
+export interface SpanshExobiologyRouteRequest {
+  search: Record<string, unknown>;
+  reference?: {
+    id64?: number | string;
+    name?: string;
+    x?: number;
+    y?: number;
+    z?: number;
+  };
+  searchReference?: string;
+  criteria?: {
+    minBiologicalSignals?: number;
+    minSampleValue?: number;
+  };
+}
+
+interface SpanshBodySearchReference {
+  name?: string;
+}
+
+interface SpanshBodySearchResult {
+  name?: string;
+  system_name?: string;
+  distance?: number;
+  distance_to_arrival?: number;
+  subtype?: string;
+  atmosphere?: string;
+  signals?: Array<{ name?: string; count?: number }>;
+  landmarks?: Array<{ subtype?: string; type?: string; value?: number }>;
+}
+
+interface SpanshBodySearchPagePayload {
+  count?: number;
+  from?: number;
+  size?: number;
+  search_reference?: string;
+  reference?: SpanshBodySearchReference;
+  results?: SpanshBodySearchResult[];
+}
+
 const delay = async (ms: number): Promise<void> =>
   new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+const toFiniteNumberOrNull = (value: unknown): number | null =>
+  typeof value === "number" && Number.isFinite(value) ? value : null;
+
+const fetchBodySearchPage = async (
+  search: Record<string, unknown>,
+  page: number,
+  size: number
+): Promise<Required<Pick<SpanshBodySearchPagePayload, "count" | "from" | "size" | "results">>> => {
+  const body: Record<string, unknown> = {
+    ...search,
+    page: Math.max(0, Math.trunc(page)),
+    size: Math.min(MAX_BODY_SEARCH_PAGE_SIZE, Math.max(1, Math.trunc(size)))
+  };
+
+  const executeSearch = (payload: Record<string, unknown>): Promise<Response> =>
+    fetch(`${SPANSH_BASE_URL}/api/bodies/search`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+
+  let response = await executeSearch(body);
+
+  // Spansh has changed support for these aggregate filters between API versions.
+  // They are only an optimization: the strict biological/value check is always
+  // performed below, so retrying without them does not weaken the result.
+  if (response.status === 400 && isRecord(body.filters)) {
+    const fallbackFilters = { ...body.filters };
+    const hadOptimizedFilters = "signal_count" in fallbackFilters || "landmark_value" in fallbackFilters;
+    delete fallbackFilters["signal_count"];
+    delete fallbackFilters["landmark_value"];
+
+    if (hadOptimizedFilters) {
+      // An empty filters object is itself invalid in Spansh. Keep any caller-supplied
+      // native filters, or use a galaxy-wide distance constraint as a neutral fallback.
+      const safeFallbackFilters = Object.keys(fallbackFilters).length > 0
+        ? fallbackFilters
+        : { distance: { min: "0", max: "40000" } };
+      response = await executeSearch({
+        ...body,
+        filters: safeFallbackFilters
+      });
+    }
+  }
+
+  if (!response.ok) {
+    const details = (await response.text()).trim().slice(0, 500);
+    throw new Error(
+      `Spansh exobiology bulk search failed with HTTP ${response.status}${details ? `: ${details}` : "."}`
+    );
+  }
+
+  const payload = await response.json() as SpanshBodySearchPagePayload;
+  const results = Array.isArray(payload.results) ? payload.results : [];
+
+  return {
+    count: toFiniteNumberOrNull(payload.count) ?? results.length,
+    from: toFiniteNumberOrNull(payload.from) ?? 0,
+    size: toFiniteNumberOrNull(payload.size) ?? results.length,
+    results
+  };
+};
 
 const mapSystemJumpToLeg = (jump: SpanshResultSystemJump): RouteLeg => ({
   systemName: jump.system,
@@ -274,5 +407,240 @@ export const generateSpanshExactRoute = async (
     routeName: `${request.sourceSystem} -> ${request.destinationSystem} (Exact)`,
     legs,
     previewRows
+  };
+};
+
+export const generateSpanshExobiologyRoute = async (
+  request: SpanshExobiologyRouteRequest
+): Promise<SpanshRouteResult> => {
+  if (!isRecord(request.search)) {
+    throw new Error("Spansh exobiology search payload is required.");
+  }
+
+  const requestedSize = toFiniteNumberOrNull(request.search.size);
+  const requestedPage = toFiniteNumberOrNull(request.search.page);
+  const targetSystems = Math.min(
+    MAX_EXOBIOLOGY_SYSTEM_RESULTS,
+    Math.max(1, Math.trunc(requestedSize ?? MAX_EXOBIOLOGY_SYSTEM_RESULTS))
+  );
+  const startPage = Math.max(0, Math.trunc(requestedPage ?? 0));
+  const minBiologicalSignals = Math.max(1, Math.trunc(request.criteria?.minBiologicalSignals ?? 3));
+  const minSampleValue = Math.max(0, request.criteria?.minSampleValue ?? 10_000_000);
+
+  const firstPage = await fetchBodySearchPage(request.search, startPage, targetSystems);
+  const totalRows = Math.max(0, firstPage.count);
+  if (totalRows === 0 && firstPage.results.length === 0) {
+    throw new Error("Spansh exobiology search returned no results.");
+  }
+
+  interface MutableSystemCandidate {
+    systemName: string;
+    distanceLy: number | null;
+    nearestBodyLs: number | null;
+    bodiesByName: Map<string, SpanshExobiologyBodyCandidate>;
+  }
+
+  const systemsByName = new Map<string, MutableSystemCandidate>();
+  const tryAppendPage = (rows: SpanshBodySearchResult[]): void => {
+    for (const row of rows) {
+      const systemName = typeof row.system_name === "string" ? row.system_name.trim() : "";
+      if (!systemName) {
+        continue;
+      }
+
+      const normalizedSystem = systemName.toLowerCase();
+      const distanceLy = toFiniteNumberOrNull(row.distance);
+      const distanceToArrivalLs = toFiniteNumberOrNull(row.distance_to_arrival);
+      const bodyName = typeof row.name === "string" ? row.name.trim() : "";
+      const bodySubtype = typeof row.subtype === "string" ? row.subtype.trim() : "";
+      const bodyAtmosphere = typeof row.atmosphere === "string" ? row.atmosphere.trim() : "";
+      const biologicalSignals = Array.isArray(row.signals)
+        ? row.signals.reduce((total, signal) =>
+          typeof signal.name === "string" && signal.name.toLowerCase() === "biological"
+            ? total + Math.max(0, Math.trunc(toFiniteNumberOrNull(signal.count) ?? 0))
+            : total, 0)
+        : 0;
+      const samplesByName = new Map<string, SpanshExobiologySampleCandidate>();
+      for (const landmark of Array.isArray(row.landmarks) ? row.landmarks : []) {
+        const name = (typeof landmark.subtype === "string" ? landmark.subtype : landmark.type)?.trim() ?? "";
+        const value = toFiniteNumberOrNull(landmark.value);
+        if (!name || value === null) {
+          continue;
+        }
+        const key = name.toLowerCase();
+        const existing = samplesByName.get(key);
+        if (!existing || value > existing.value) {
+          samplesByName.set(key, { name, value });
+        }
+      }
+      const samples = Array.from(samplesByName.values()).sort((left, right) => right.value - left.value);
+
+      // A planet is only accepted when every identified biological sample meets the
+      // requested value. Unknown sample values are deliberately not treated as profitable.
+      if (
+        biologicalSignals < minBiologicalSignals
+        || samples.length === 0
+        || samples.some((sample) => sample.value < minSampleValue)
+      ) {
+        continue;
+      }
+
+      const existingSystem = systemsByName.get(normalizedSystem);
+      const systemCandidate: MutableSystemCandidate = existingSystem ?? {
+        systemName,
+        distanceLy,
+        nearestBodyLs: distanceToArrivalLs,
+        bodiesByName: new Map<string, SpanshExobiologyBodyCandidate>()
+      };
+
+      if (distanceLy !== null && (systemCandidate.distanceLy === null || distanceLy < systemCandidate.distanceLy)) {
+        systemCandidate.distanceLy = distanceLy;
+      }
+
+      if (distanceToArrivalLs !== null && (systemCandidate.nearestBodyLs === null || distanceToArrivalLs < systemCandidate.nearestBodyLs)) {
+        systemCandidate.nearestBodyLs = distanceToArrivalLs;
+      }
+
+      if (bodyName) {
+        const normalizedBodyName = bodyName.toLowerCase();
+        const existingBody = systemCandidate.bodiesByName.get(normalizedBodyName);
+        if (!existingBody) {
+          systemCandidate.bodiesByName.set(normalizedBodyName, {
+            bodyName,
+            distanceToArrivalLs,
+            subtype: bodySubtype || null,
+            atmosphere: bodyAtmosphere || null,
+            biologicalSignals,
+            samples
+          });
+        } else {
+          if (distanceToArrivalLs !== null && (existingBody.distanceToArrivalLs === null || distanceToArrivalLs < existingBody.distanceToArrivalLs)) {
+            existingBody.distanceToArrivalLs = distanceToArrivalLs;
+          }
+          if (!existingBody.subtype && bodySubtype) {
+            existingBody.subtype = bodySubtype;
+          }
+          if (!existingBody.atmosphere && bodyAtmosphere) {
+            existingBody.atmosphere = bodyAtmosphere;
+          }
+          existingBody.biologicalSignals = Math.max(existingBody.biologicalSignals, biologicalSignals);
+          existingBody.samples = samples;
+        }
+      }
+
+      systemsByName.set(normalizedSystem, systemCandidate);
+    }
+  };
+
+  const totalPages = Math.max(1, Math.ceil(Math.max(totalRows, firstPage.results.length) / targetSystems));
+  let scannedPages = 0;
+  for (let page = startPage; page < totalPages; page += 1) {
+    if (scannedPages >= MAX_EXOBIOLOGY_SCAN_PAGES || systemsByName.size >= targetSystems) {
+      break;
+    }
+
+    const pagePayload = page === startPage
+      ? firstPage
+      : await fetchBodySearchPage(request.search, page, targetSystems);
+    tryAppendPage(pagePayload.results);
+    scannedPages += 1;
+  }
+
+  const exobiologySystems: SpanshExobiologySystemCandidate[] = Array.from(systemsByName.values()).map((system) => {
+    const bodies = Array.from(system.bodiesByName.values()).sort((left, right) => {
+      const leftLs = left.distanceToArrivalLs;
+      const rightLs = right.distanceToArrivalLs;
+
+      if (leftLs === null && rightLs === null) {
+        return left.bodyName.localeCompare(right.bodyName);
+      }
+      if (leftLs === null) {
+        return 1;
+      }
+      if (rightLs === null) {
+        return -1;
+      }
+
+      return leftLs - rightLs;
+    });
+
+    const nearestBodyLs = system.nearestBodyLs ?? bodies.find((body) => body.distanceToArrivalLs !== null)?.distanceToArrivalLs ?? null;
+
+    return {
+      systemName: system.systemName,
+      distanceLy: system.distanceLy,
+      nearestBodyLs,
+      bodies
+    };
+  }).sort((left, right) => {
+    const leftLy = left.distanceLy;
+    const rightLy = right.distanceLy;
+
+    if (leftLy === null && rightLy !== null) {
+      return 1;
+    }
+    if (leftLy !== null && rightLy === null) {
+      return -1;
+    }
+    if (leftLy !== null && rightLy !== null && leftLy !== rightLy) {
+      return leftLy - rightLy;
+    }
+
+    const leftLs = left.nearestBodyLs;
+    const rightLs = right.nearestBodyLs;
+    if (leftLs === null && rightLs !== null) {
+      return 1;
+    }
+    if (leftLs !== null && rightLs === null) {
+      return -1;
+    }
+    if (leftLs !== null && rightLs !== null && leftLs !== rightLs) {
+      return leftLs - rightLs;
+    }
+
+    return left.systemName.localeCompare(right.systemName);
+  }).slice(0, targetSystems);
+
+  if (exobiologySystems.length === 0) {
+    throw new Error("Spansh exobiology search did not contain valid system rows.");
+  }
+
+  const uniqueSystems = exobiologySystems.map((system) => ({
+    systemName: system.systemName,
+    distance: system.distanceLy
+  }));
+
+  const legs: RouteLeg[] = uniqueSystems.map((system) => ({
+    systemName: system.systemName,
+    distance: system.distance,
+    distanceRemaining: null,
+    fuelLeft: null,
+    fuelUsed: null,
+    refuel: false,
+    neutronStar: false
+  }));
+
+  const previewRows: SpanshRoutePreviewRow[] = uniqueSystems.map((system, index) => ({
+    systemName: system.systemName,
+    distance: system.distance,
+    distanceRemaining: null,
+    estimatedJumps: uniqueSystems.length - index - 1,
+    refuel: false,
+    neutronStar: false
+  }));
+
+  const referenceSystemValue = typeof request.search.reference_system === "string"
+    ? request.search.reference_system.trim()
+    : "";
+  const routeLabel = referenceSystemValue
+    || request.reference?.name?.trim()
+    || request.searchReference?.trim()
+    || "Filtered search";
+
+  return {
+    routeName: `Exobiology ${routeLabel}`,
+    legs,
+    previewRows,
+    exobiologySystems
   };
 };

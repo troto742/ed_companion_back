@@ -12,6 +12,7 @@ export interface CommoditySearchStation {
 export interface CommoditySearchResult {
   sourceSystem: string;
   commodity: string;
+  best: CommoditySearchStation[];
   cheapest: CommoditySearchStation[];
   nearest: CommoditySearchStation[];
 }
@@ -154,6 +155,56 @@ const compareByFreshness = (left: CommoditySearchStation, right: CommoditySearch
   return rightMs - leftMs;
 };
 
+const getComparablePrice = (value: number | null): number => {
+  return value === null || !Number.isFinite(value) ? Number.MAX_SAFE_INTEGER : value;
+};
+
+const getComparableDistance = (value: number | null): number => {
+  return value === null || !Number.isFinite(value) ? Number.MAX_SAFE_INTEGER : value;
+};
+
+const buildBestMissionRank = (stations: CommoditySearchStation[]): CommoditySearchStation[] => {
+  const priced = stations
+    .map((station) => getComparablePrice(station.price))
+    .filter((price) => price !== Number.MAX_SAFE_INTEGER)
+    .sort((left, right) => left - right);
+
+  const cheapestPrice = priced[0] ?? 0;
+
+  return [...stations].sort((left, right) => {
+    const leftDistance = getComparableDistance(left.distanceLy);
+    const rightDistance = getComparableDistance(right.distanceLy);
+    const leftPrice = getComparablePrice(left.price);
+    const rightPrice = getComparablePrice(right.price);
+
+    const leftPricePremium = cheapestPrice > 0 && leftPrice !== Number.MAX_SAFE_INTEGER
+      ? (leftPrice - cheapestPrice) / cheapestPrice
+      : 0;
+    const rightPricePremium = cheapestPrice > 0 && rightPrice !== Number.MAX_SAFE_INTEGER
+      ? (rightPrice - cheapestPrice) / cheapestPrice
+      : 0;
+
+    const leftScore = leftDistance + (leftPricePremium * 35);
+    const rightScore = rightDistance + (rightPricePremium * 35);
+
+    if (leftScore !== rightScore) {
+      return leftScore - rightScore;
+    }
+
+    const byDistance = compareNullableNumber(left.distanceLy, right.distanceLy);
+    if (byDistance !== 0) {
+      return byDistance;
+    }
+
+    const byPrice = compareNullableNumber(left.price, right.price);
+    if (byPrice !== 0) {
+      return byPrice;
+    }
+
+    return compareByFreshness(left, right);
+  });
+};
+
 export const searchCommodityMarkets = async (
   sourceSystemInput: string,
   commodityInput: string,
@@ -169,6 +220,7 @@ export const searchCommodityMarkets = async (
     return {
       sourceSystem,
       commodity,
+      best: [],
       cheapest: [],
       nearest: []
     };
@@ -177,27 +229,13 @@ export const searchCommodityMarkets = async (
   const stations = (await getStations(sourceSystem, commodity, minSupply, maxDistance, maxDaysAgo))
     .filter((entry) => entry.supply !== null && entry.supply >= minSupply);
 
+  const best = buildBestMissionRank(stations).slice(0, limit);
+
   const cheapest = [...stations]
     .sort((left, right) => {
-      const byFreshness = compareByFreshness(left, right);
-      if (byFreshness !== 0) {
-        return byFreshness;
-      }
-
       const byPrice = compareNullableNumber(left.price, right.price);
       if (byPrice !== 0) {
         return byPrice;
-      }
-
-      return compareNullableNumber(left.distanceLy, right.distanceLy);
-    })
-    .slice(0, limit);
-
-  const nearest = [...stations]
-    .sort((left, right) => {
-      const byFreshness = compareByFreshness(left, right);
-      if (byFreshness !== 0) {
-        return byFreshness;
       }
 
       const byDistance = compareNullableNumber(left.distanceLy, right.distanceLy);
@@ -205,13 +243,30 @@ export const searchCommodityMarkets = async (
         return byDistance;
       }
 
-      return compareNullableNumber(left.price, right.price);
+      return compareByFreshness(left, right);
+    })
+    .slice(0, limit);
+
+  const nearest = [...stations]
+    .sort((left, right) => {
+      const byDistance = compareNullableNumber(left.distanceLy, right.distanceLy);
+      if (byDistance !== 0) {
+        return byDistance;
+      }
+
+      const byPrice = compareNullableNumber(left.price, right.price);
+      if (byPrice !== 0) {
+        return byPrice;
+      }
+
+      return compareByFreshness(left, right);
     })
     .slice(0, limit);
 
   return {
     sourceSystem,
     commodity,
+    best,
     cheapest,
     nearest
   };
